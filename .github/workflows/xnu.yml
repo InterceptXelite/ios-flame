@@ -36,7 +36,9 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # GitHub retired the macos-14 image (Nov 2026). macos-15 with its OLDEST Xcode
+    # is the closest to the Xcode 15 toolchain xnu-8796 was built with.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
