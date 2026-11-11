@@ -13,14 +13,24 @@ K="${1:?usage: tools/flame-build.sh <xnu kernel> [cpus]}"
 CPUS="${2:-1}"   # start with 1 core; 6 once the kernel is stable on flame
 
 [ -f tools/flame_board.json ] || { echo "missing tools/flame_board.json"; exit 1; }
-[ -f dtb/vendor_boot.img ] || { echo "missing dtb/vendor_boot.img (stock, from your backup)"; exit 1; }
+# dtb/vendor_boot.img optional (alignment padding only)
 
 # sweet-only hardware drivers stay OFF on flame until the flame drivers exist:
 #   sweettouch=0  (Goodix on sweet's I2C bus + RPMh vote at sweet addresses)
 #   sweetkeys=0   (SPMI arb v5 at sweet addresses; flame has arb v7)
 #   sweetusb=0
 FLAME_OFF="sweettouch=0 sweetkeys=0 sweetusb=0"
-B="debug=0xc serial=3 cpus=$CPUS keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 $FLAME_OFF"
+# MODE=safe (default): READ-ONLY. userdata still holds Android: no ufsrw, no
+#   persistent log (sweetlog writes the LAST 4 MiB of userdata). Use until stage 4.
+# MODE=ios: after the iOS root is flashed to userdata (stage 4): read-write + log.
+MODE="${MODE:-safe}"
+if [ "$MODE" = ios ]; then
+	RW="ufsrw=1 rootrw=1"
+else
+	RW="sweetlog=0"
+fi
+B="debug=0xc serial=3 cpus=$CPUS keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin $RW launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 $FLAME_OFF"
+echo "mode: $MODE  ($RW)"
 
 mkdir -p shim/out
 python3 tools/mkadt.py shim/out/flame.adt --highmem

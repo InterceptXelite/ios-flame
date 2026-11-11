@@ -28,9 +28,8 @@ else
 	python3 -c "import gzip,sys; n=b'TRAILER!!!\\0'; h=b'070701'+b'00000000'*4+b'00000001'+b'00000000'*6+b'%08X'%len(n)+b'00000000'; e=h+n; e+=b'\\0'*((-len(e))%4); e+=b'\\0'*((-len(e))%512); sys.stdout.buffer.write(gzip.compress(e,9))" > out/ramdisk.bin   # empty newc cpio, no cpio tool needed
 fi
 VB=../dtb/vendor_boot.img
-if [ -n "${1:-}" ] && [ ! -f "$VB" ]; then
-	echo "error: an XNU payload needs flame's stock vendor_boot.img in dtb/ (from your backup) for alignment" >&2; exit 1
-fi
+# vendor_boot.img is optional: with it the payload is padded to land 4K-aligned;
+# without it the shim finds the payload byte by byte and slides it into alignment.
 python3 ../tools/flame-mkboot.py --kernel out/Image --ramdisk out/ramdisk.bin $([ -f "$VB" ] && echo --vendor-boot "$VB") -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test

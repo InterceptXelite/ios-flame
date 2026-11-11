@@ -65,15 +65,6 @@ static void zero64(uintptr_t dst, uint64_t n)
 		d[i] = 0;
 }
 
-static int magic_ok(const char *m)
-{
-	static const char want[] = "SWEETXNU";
-	for (int i = 0; i < 8; i++)
-		if (m[i] != want[i])
-			return 0;
-	return 1;
-}
-
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 const char *loader_boot(uintptr_t dtb)
@@ -90,16 +81,38 @@ const char *loader_boot(uintptr_t dtb)
 	 * pads our ramdisk (tools/flame-mkboot.py) so the payload lands 4K-aligned;
 	 * the scan still walks 8-byte steps in case ABL packs the ramdisks differently. */
 	const struct payload *p = 0;
-	for (uint64_t a = (rd_start + 7) & ~7UL; a + sizeof(struct payload) <= rd_end; a += 8) {
-		if (magic_ok(((const struct payload *)a)->magic)) {
-			p = (const struct payload *)a;
+	/* flame: ABL puts our ramdisk directly behind vendor_boot's, at whatever
+	 * byte offset that ends on, so scan BYTE by byte (MMU off = Device memory:
+	 * only byte loads are safe at an unknown alignment). */
+	const volatile uint8_t *b = (const volatile uint8_t *)rd_start;
+	uint64_t n = rd_end - rd_start, at = n;
+	static const char want[] = "SWEETXNU";
+	for (uint64_t i = 0; i + sizeof(struct payload) <= n; i++) {
+		if (b[i] != 'S')
+			continue;
+		int k = 1;
+		while (k < 8 && b[i + k] == (uint8_t)want[k])
+			k++;
+		if (k == 8) {
+			at = i;
 			break;
 		}
 	}
-	if (!p)
+	if (at == n)
 		return "no SWEETXNU payload";
-	con_hex2("PAYLOAD", "at=", (uint64_t)(uintptr_t)p, "skip=", (uint64_t)(uintptr_t)p - rd_start);
-	rd_start = (uint64_t)(uintptr_t)p;
+	uint64_t src = rd_start + at, dst = src & ~7UL;
+	con_hex2("PAYLOAD", "at=", src, "skip=", at);
+	if (dst != src) {
+		/* Slide everything from the payload to the end of the ramdisk down
+		 * to an 8-byte boundary (< 8 bytes, forward byte copy is safe). */
+		volatile uint8_t *d = (volatile uint8_t *)dst;
+		for (uint64_t i = 0; i < rd_end - src; i++)
+			d[i] = b[at + i];
+		rd_end -= src - dst;
+		con_hex2("PAYLOAD", "moved to=", dst, "by=", src - dst);
+	}
+	p = (const struct payload *)dst;
+	rd_start = dst;
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
