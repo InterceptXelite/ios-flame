@@ -88,13 +88,29 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
  * the real banks. Find the bank that contains `addr`; returns its base/size.
  * Handles #address-cells/#size-cells of the root (1 or 2 each).
  */
+static int fdt_memory_walk(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_t *size,
+			   void (*cb)(const char *name, uint64_t b, uint64_t s));
+
 int fdt_memory_bank(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_t *size)
+{
+	return fdt_memory_walk(fdt, addr, base, size, 0);
+}
+
+void fdt_memory_dump(uintptr_t fdt, void (*cb)(const char *name, uint64_t b, uint64_t s))
+{
+	uint64_t b, s;
+	fdt_memory_walk(fdt, ~0UL, &b, &s, cb);
+}
+
+static int fdt_memory_walk(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_t *size,
+			   void (*cb)(const char *name, uint64_t b, uint64_t s))
 {
 	if (!fdt || be32(fdt) != FDT_MAGIC)
 		return 0;
 	uintptr_t p = fdt + be32(fdt + 8);
 	uintptr_t strings = fdt + be32(fdt + 12);
 	int depth = 0, is_mem = 0;
+	const char *node = "";
 	uint32_t ac = 2, sc = 1;
 	uintptr_t reg = 0;
 	uint32_t reg_len = 0;
@@ -109,6 +125,11 @@ int fdt_memory_bank(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_t *size
 				is_mem = 0;
 				reg = 0;
 				reg_len = 0;
+				node = (const char *)p;
+				/* also accept nodes named memory@... without device_type */
+				if (node[0] == 'm' && node[1] == 'e' && node[2] == 'm' && node[3] == 'o' &&
+				    node[4] == 'r' && node[5] == 'y' && (node[6] == 0 || node[6] == '@'))
+					is_mem = 1;
 			}
 			p = align4(skip_str(p));
 			break;
@@ -119,7 +140,9 @@ int fdt_memory_bank(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_t *size
 					uint64_t b = ac == 2 ? (uint64_t)be32(reg + o) << 32 | be32(reg + o + 4) : be32(reg + o);
 					uintptr_t s_ = reg + o + ac * 4;
 					uint64_t s = sc == 2 ? (uint64_t)be32(s_) << 32 | be32(s_ + 4) : be32(s_);
-					if (s && addr >= b && addr < b + s) {
+					if (cb && s)
+						cb(node, b, s);
+					if (!cb && s && addr >= b && addr < b + s) {
 						*base = b;
 						*size = s;
 						return 1;

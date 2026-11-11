@@ -67,6 +67,12 @@ static void zero64(uintptr_t dst, uint64_t n)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+static void show_bank(const char *name, uint64_t b, uint64_t sz)
+{
+	(void)name;
+	con_hex2("DRAM", "base=", b, "MiB=", sz >> 20);
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -121,8 +127,11 @@ const char *loader_boot(uintptr_t dtb)
 	/* flame: 4 GB and 6 GB variants exist and the DTB has no static /memory.
 	 * Clamp the kernel's RAM to the DRAM bank ABL reported; refuse if absent. */
 	uint64_t mem_size = p->mem_size, bank_b, bank_s;
-	if (!fdt_memory_bank(dtb, p->phys_base, &bank_b, &bank_s))
-		return "no DRAM bank at phys_base in ABL's /memory";
+	if (!fdt_memory_bank(dtb, p->phys_base, &bank_b, &bank_s)) {
+		con_hex2("NEED", "phys_base=", p->phys_base, "size=", p->mem_size);
+		fdt_memory_dump(dtb, show_bank);
+		return "no DRAM bank at phys_base (banks above)";
+	}
 	if (p->phys_base + mem_size > bank_b + bank_s)
 		mem_size = (bank_b + bank_s - p->phys_base) & ~(PAGE_16K - 1);
 	con_hex2("DRAM", "bank=", bank_b >> 20, "MiB=", bank_s >> 20);

@@ -419,6 +419,10 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+	if (why[0] != 'n' || why[1] != 'o' || why[3] != 'S') {	/* payload present but refused */
+		con_str("STOP", "payload not started - take a photo");
+		reset(90);
+	}
 
 #ifndef FLAME_DIAG_SKIP_UFS
 	/* No payload: probe the internal UFS while the MMU is still off. */
