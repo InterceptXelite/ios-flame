@@ -177,3 +177,26 @@ static int fdt_memory_walk(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_
 		}
 	}
 }
+
+/* Largest /memory bank whose base is >= min_base (flame: pick XNU's RAM at run
+ * time; the upper DRAM banks are split by carve-outs and their addresses are
+ * only known from ABL's patched /memory). Returns 0 if none. */
+static uint64_t lb_min, lb_b, lb_s;
+static void lb_cb(const char *name, uint64_t b, uint64_t s)
+{
+	(void)name;
+	if (b >= lb_min && s > lb_s) {
+		lb_b = b;
+		lb_s = s;
+	}
+}
+
+int fdt_memory_largest(uintptr_t fdt, uint64_t min_base, uint64_t *base, uint64_t *size)
+{
+	lb_min = min_base;
+	lb_b = lb_s = 0;
+	fdt_memory_dump(fdt, lb_cb);
+	*base = lb_b;
+	*size = lb_s;
+	return lb_s != 0;
+}

@@ -70,7 +70,34 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 static void show_bank(const char *name, uint64_t b, uint64_t sz)
 {
 	(void)name;
-	con_hex2("DRAM", "base=", b, "MiB=", sz >> 20);
+	con_hex2("DRAM", "base_hi=", (uint32_t)(b >> 32), "lo=", (uint32_t)b);
+	con_hex2("", "  MiB=", (uint32_t)(sz >> 20), "", 0);
+}
+
+static int adt_name_is(const volatile uint8_t *n, const char *want)
+{
+	int i = 0;
+	for (; want[i]; i++)
+		if (n[i] != (uint8_t)want[i])
+			return 0;
+	return n[i] == 0;
+}
+
+static void adt_set_u64(uintptr_t adt, uint64_t len, const char *name, uint64_t v)
+{
+	for (uint64_t o = 0; o + 44 <= len; o += 4) {
+		const volatile uint8_t *n = (const volatile uint8_t *)(adt + o);
+		if (n[0] != (uint8_t)name[0] || !adt_name_is(n, name))
+			continue;
+		volatile uint32_t *lenp = (volatile uint32_t *)(adt + o + 32);
+		if ((*lenp & 0x7fffffff) != 8)
+			continue;
+		volatile uint32_t *val = (volatile uint32_t *)(adt + o + 36);
+		val[0] = (uint32_t)v;
+		val[1] = (uint32_t)(v >> 32);
+		return;
+	}
+	con_str("ADT", "property not found (kernel uses boot_args)");
 }
 
 const char *loader_boot(uintptr_t dtb)
@@ -122,25 +149,33 @@ const char *loader_boot(uintptr_t dtb)
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
-	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-
-	/* flame: 4 GB and 6 GB variants exist and the DTB has no static /memory.
-	 * Clamp the kernel's RAM to the DRAM bank ABL reported; refuse if absent. */
-	uint64_t mem_size = p->mem_size, bank_b, bank_s;
-	if (!fdt_memory_bank(dtb, p->phys_base, &bank_b, &bank_s)) {
-		con_hex2("NEED", "phys_base=", p->phys_base, "size=", p->mem_size);
+	/* flame: 4 GB and 6 GB variants exist and the upper DRAM is split into
+	 * banks by carve-outs; ABL patches /memory at boot. If the build-time base
+	 * is not inside a bank, take the largest bank above 4 GiB instead
+	 * (32 MiB aligned: XNU maps the kernel with 32 MiB blocks), and refuse if
+	 * there is none. Every PA below is derived from `phys`. */
+	uint64_t phys = p->phys_base, mem_size = p->mem_size, bank_b, bank_s;
+	if (!fdt_memory_bank(dtb, phys, &bank_b, &bank_s)) {
 		fdt_memory_dump(dtb, show_bank);
-		return "no DRAM bank at phys_base (banks above)";
+		if (!fdt_memory_largest(dtb, 0x100000000UL, &bank_b, &bank_s))
+			return "no DRAM bank above 4G in ABL's /memory";
+		phys = (bank_b + 0x1ffffffUL) & ~0x1ffffffUL;
+		if (phys >= bank_b + bank_s)
+			return "DRAM bank too small";
+		con_hex("RELOC phys", phys);
 	}
-	if (p->phys_base + mem_size > bank_b + bank_s)
-		mem_size = (bank_b + bank_s - p->phys_base) & ~(PAGE_16K - 1);
-	con_hex2("DRAM", "bank=", bank_b >> 20, "MiB=", bank_s >> 20);
-	con_hex2("PHYS", "base=", p->phys_base, "size=", mem_size);
+	if (phys + mem_size > bank_b + bank_s)
+		mem_size = (bank_b + bank_s - phys) & ~(PAGE_16K - 1);
+	if (mem_size < 0x30000000UL)
+		return "DRAM bank < 768 MiB for XNU";
+	uint64_t pa_of_va_base = phys - p->virt_base;	/* pa = va + this */
+	con_hex("PHYS base", phys);
+	con_hex2("PHYS", "MiB=", mem_size >> 20, "bank MiB=", bank_s >> 20);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > p->phys_base && rd_start < p->phys_base + mem_size)
+	if (rd_end > phys && rd_start < phys + mem_size)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
@@ -155,6 +190,11 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	/* flame: keep the ADT's /chosen dram-base/dram-size equal to what we hand
+	 * the kernel (phys may have moved at run time). ADT property: name[32],
+	 * u32 length, value; values are only 4-byte aligned -> two 32-bit stores. */
+	adt_set_u64(adt_pa, p->adt_size, "dram-base", phys);
+	adt_set_u64(adt_pa, p->adt_size, "dram-size", mem_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
@@ -163,7 +203,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Revision = 2;
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
-	ba->physBase = p->phys_base;
+	ba->physBase = phys;
 	ba->memSize = mem_size;
 	ba->topOfKernelData = top;
 	ba->Video.v_baseAddr = FB_BASE;

@@ -9,3 +9,6 @@ int fdt_memory_bank(uintptr_t fdt, uint64_t addr, uint64_t *base, uint64_t *size
 
 /* Call cb for every bank of every /memory node (diagnostics). */
 void fdt_memory_dump(uintptr_t fdt, void (*cb)(const char *name, uint64_t b, uint64_t s));
+
+/* Largest /memory bank with base >= min_base. */
+int fdt_memory_largest(uintptr_t fdt, uint64_t min_base, uint64_t *base, uint64_t *size);
