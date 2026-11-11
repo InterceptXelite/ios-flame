@@ -1,0 +1,46 @@
+diff -ruN ua/bsd/dev/sweet_ufs.c ub/bsd/dev/sweet_ufs.c
+--- ua/bsd/dev/sweet_ufs.c	2026-11-11 17:51:59.296840647 +0530
++++ ub/bsd/dev/sweet_ufs.c	2026-11-11 17:51:59.311284462 +0530
+@@ -120,13 +120,16 @@
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+ {
+-	return *(volatile uint32_t *)(su.regs + off);
++	/* flame: plain LDR/STR only (no writeback forms) for all MMIO. */
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(su.regs + off) : "memory");
++	return v;
+ }
+ 
+ static inline void
+ ufs_wr(uint32_t off, uint32_t v)
+ {
+-	*(volatile uint32_t *)(su.regs + off) = v;
++	__asm__ volatile ("str %w0, [%1]" : : "r"(v), "r"(su.regs + off) : "memory");
+ }
+ 
+ static void
+@@ -625,6 +628,23 @@
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
++		/*
++		 * flame: ABL leaves the UFS device in PowerDown; every LU answers
++		 * NOT READY 04/02 (phone-verified, shim stage 1h). Wake it through
++		 * the "UFS Device" well-known LU (UPIU LUN 0xD0) with START STOP
++		 * UNIT, POWER CONDITION = ACTIVE, as Linux ufshcd_set_dev_pwr_mode
++		 * does (verified working on the phone, shim stage 1i). Harmless if
++		 * the device is already active.
++		 */
++		static const uint8_t ssu_active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		su.lun = 0xd0;
++		for (int i = 0; i < 2 && ufs_scsi(tur, sizeof(tur), 0, false); i++) {
++		}
++		int ssu_error = EIO;
++		for (int i = 0; i < 3 && (ssu_error = ufs_scsi(ssu_active, sizeof(ssu_active), 0, false)); i++) {
++		}
++		su.lun = 0;
++		printf("SWEET UFS: device wake (W-LUN SSU active) %s\n", ssu_error ? "failed" : "ok");
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}

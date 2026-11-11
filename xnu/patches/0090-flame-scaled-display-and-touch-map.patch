@@ -1,0 +1,197 @@
+diff -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-11 17:16:39.914722686 +0530
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-11 17:17:54.012136758 +0530
+@@ -69,7 +69,7 @@
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+-#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel (flame: 260 real) */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -80,6 +80,13 @@
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++/*
++ * flame: the panel (720x1640) is SMALLER than the iPhone X, so the logical
++ * display cannot be cropped onto it. It is scaled by 16/25 (= 720/1125,
++ * uniform, no distortion) to 720x1559 and centred vertically (40 px bars).
++ */
++#define FLAME_SCALE_NUM                 16
++#define FLAME_SCALE_DEN                 25
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -104,6 +111,8 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScaled;                  /* flame: logical > panel, shrink */
++	int32_t       fBarY;                    /* panel rows above the scaled image */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -122,6 +131,7 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -176,6 +186,19 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fScaled = false;
++	fBarY = 0;
++	if (!native && fWidth < SWEET_FB_LOGICAL_W) {
++		/* flame 720x1640: present the iPhone X size and shrink every frame */
++		fLogicalW = SWEET_FB_LOGICAL_W;
++		fLogicalH = SWEET_FB_LOGICAL_H;
++		fOffX = fOffY = 0;
++		fScaled = true;
++		fBarY = ((int32_t)fHeight - (int32_t)(SWEET_FB_LOGICAL_H * FLAME_SCALE_NUM / FLAME_SCALE_DEN)) / 2;
++		if (fBarY < 0) {
++			fBarY = 0;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -359,6 +382,11 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaled) {
++			presentScaled(s, sx, sy, dx, dy, w, h);
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+@@ -401,6 +429,78 @@
+ 	}
+ }
+ 
++/*
++ * flame: nearest-neighbour shrink of one layer. (dx,dy,w,h) is the layer's
++ * rectangle in logical 1125x2436 coordinates, (sx,sy) its origin in the
++ * surface. Only the panel pixels the rectangle covers are written.
++ */
++void
++AppleCLCD::presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	uintptr_t src = s->kernelAddress();
++	uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++
++	if (src == 0 || bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->memory == NULL) {
++		return;
++	}
++	if (w <= 0 || h <= 0) {
++		w = (int32_t)s->width;
++		h = (int32_t)s->height;
++	}
++	if (sx < 0 || sy < 0) {
++		sx = sy = 0;
++	}
++	if (dx < 0 || dy < 0) {
++		dx = dy = 0;
++	}
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fLogicalW - dx) {
++		w = (int32_t)fLogicalW - dx;
++	}
++	if (h > (int32_t)fLogicalH - dy) {
++		h = (int32_t)fLogicalH - dy;
++	}
++	if (w <= 0 || h <= 0) {
++		return;
++	}
++	uint64_t len = s->memory->getLength();
++	/* panel rectangle covered by the logical one */
++	int32_t px0 = dx * FLAME_SCALE_NUM / FLAME_SCALE_DEN;
++	int32_t px1 = ((dx + w) * FLAME_SCALE_NUM + FLAME_SCALE_DEN - 1) / FLAME_SCALE_DEN;
++	int32_t py0 = dy * FLAME_SCALE_NUM / FLAME_SCALE_DEN;
++	int32_t py1 = ((dy + h) * FLAME_SCALE_NUM + FLAME_SCALE_DEN - 1) / FLAME_SCALE_DEN;
++	if (px1 > (int32_t)fWidth) {
++		px1 = (int32_t)fWidth;
++	}
++	if (py1 + fBarY > (int32_t)fHeight) {
++		py1 = (int32_t)fHeight - fBarY;
++	}
++	for (int32_t py = py0; py < py1; py++) {
++		int32_t ly = (py * FLAME_SCALE_DEN + FLAME_SCALE_DEN / 2) / FLAME_SCALE_NUM;	/* centre sample */
++		if (ly < dy || ly >= dy + h) {
++			continue;
++		}
++		uint64_t srow = (uint64_t)s->offset + (uint64_t)(sy + ly - dy) * s->bytesPerRow;
++		if (srow + (uint64_t)(sx + w) * 4 > len) {
++			break;
++		}
++		const uint32_t *in = (const uint32_t *)(src + srow);
++		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)(py + fBarY) * fRowBytes);
++		for (int32_t px = px0; px < px1; px++) {
++			int32_t lx = (px * FLAME_SCALE_DEN + FLAME_SCALE_DEN / 2) / FLAME_SCALE_NUM;
++			if (lx < dx || lx >= dx + w) {
++				continue;
++			}
++			out[px] = in[sx + lx - dx];
++		}
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-11 17:16:39.772891506 +0530
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-11 17:17:54.012309170 +0530
+@@ -434,10 +434,13 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/* flame: the touch driver reports PANEL pixels (720x1640). The panel shows the
++	 * 1125x2436 iPhone X display shrunk 16/25 with 40 px bars (SweetFramebuffer.cpp),
++	 * so panel -> logical is x*25/16, (y-40)*25/16. Native mode: panel 1:1. */
++	fLogicalW = native ? 720 : 1125;
++	fLogicalH = native ? 1640 : 2436;
++	fOffX = 0;
++	fOffY = native ? 0 : -((1640 - 2436 * 16 / 25) / 2);
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -464,8 +467,19 @@
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	int64_t lx = (int64_t)(x + fOffX), ly = (int64_t)(y + fOffY);
++	if (fLogicalW != 720) {		/* scaled presentation */
++		lx = lx * 25 / 16;
++		ly = ly * 25 / 16;
++	}
++	if (ly < 0) {
++		ly = 0;			/* touches on the letterbox bars land on the edge */
++	}
++	if (ly > fLogicalH - 1) {
++		ly = fLogicalH - 1;
++	}
++	IOFixed nx = (IOFixed)((lx << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)((ly << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
