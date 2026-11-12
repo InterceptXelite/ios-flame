@@ -129,14 +129,42 @@ static void find_panel(uintptr_t dtb)
 
 /* ---- GENI SPI, FIFO mode, polled ---- */
 
+/* CS is never toggled by the engine itself (Linux spi-geni does the same):
+ * explicit SPI_CS_ASSERT (8) / SPI_CS_DEASSERT (9) commands around each frame. */
+static int spi_cmd(uint32_t op)
+{
+	wr(SE + SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+	wr(SE + SE_GENI_M_CMD0, op << 27);
+	uint64_t end = ticks() + 19200 * 10;
+	while (ticks() < end)
+		if (rd(SE + SE_GENI_M_IRQ_STATUS) & 1) {
+			wr(SE + SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+			return 0;
+		}
+	con_hex2("SPI CS TIMEOUT", "op=", op, "irq=", rd(SE + SE_GENI_M_IRQ_STATUS));
+	return -1;
+}
+
+static int spi_frame(const uint8_t *tx, uint8_t *rx, uint32_t n);
+
 static int spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
+{
+	if (spi_cmd(8))
+		return -1;
+	int r = spi_frame(tx, rx, n);
+	spi_cmd(9);
+	udelay(5);
+	return r;
+}
+
+static int spi_frame(const uint8_t *tx, uint8_t *rx, uint32_t n)
 {
 	if (n == 0 || n > fifo_words * 4)
 		return -1;
 	wr(SE + SE_GENI_M_IRQ_CLEAR, 0xffffffff);
 	wr(SE + SE_SPI_TX_LEN, n);
 	wr(SE + SE_SPI_RX_LEN, n);
-	wr(SE + SE_GENI_M_CMD0, 7u << 27);		/* SPI_TX_RX, no fragmentation */
+	wr(SE + SE_GENI_M_CMD0, (7u << 27) | (1u << 2));	/* SPI_TX_RX, FRAGMENTATION */
 	for (uint32_t i = 0; i < n; i += 4) {
 		uint32_t w = 0;
 		for (uint32_t b = 0; b < 4 && i + b < n; b++)
@@ -335,7 +363,7 @@ static int se_spi_setup(void)
 
 void test_touch(uintptr_t dtb)
 {
-	con_str("SHIM", "ios-flame stage 6d: touch diagnostics");
+	con_str("SHIM", "ios-flame stage 6e: touch diagnostics");
 	con_skip();
 	find_panel(dtb);
 	int novatek = has(panel, "c3f_35") || has(panel, "c3f_37") || has(panel, "c3f_43");
