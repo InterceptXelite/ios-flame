@@ -82,7 +82,6 @@ static void state(const char *tag)
 static int gpu_power(void)
 {
 	state("BEFORE");
-	con_hex2("  pll0", "mode=", R(GPUCC + 0x0), "pll1=", R(GPUCC + 0x1000));
 	con_hex("  probe faults", bad);
 	if (bad) {
 		con_str("GPU", "GPU_CC not readable from EL1 - stop");
@@ -173,6 +172,45 @@ static uint32_t sqe[16384] __attribute__((aligned(4096)));	/* 64 KiB */
 static uint32_t ring[8192] __attribute__((aligned(32768)));	/* 32 KiB */
 static volatile uint32_t scratch[1024] __attribute__((aligned(4096)));
 
+
+/* stage-1 identity map, 1 GiB blocks, 39-bit VA (3-level, start at L1) */
+static uint64_t smmu_l1[512] __attribute__((aligned(4096)));
+
+static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
+{
+	(void)psz;
+	for (int i = 0; i < 512; i++)
+		smmu_l1[i] = 0;
+	for (uint64_t g = 0; g < 16; g++)		/* PA 0 .. 16 GiB */
+		smmu_l1[g] = (g << 30) | (1u << 10) | (3u << 8) | (1u << 6) | 1;	/* AF, inner-sh, AP=RW all, block, attr0 */
+	__asm__ volatile("dsb sy" ::: "memory");
+	uintptr_t c = cb;				/* context bank 0 */
+	W(c + 0x0, 0);					/* SCTLR off while programming */
+	W(SMMU + 0x1000 + 0x800, 1);			/* CBA2R0: VA64 */
+	W(SMMU + 0x1000, 1u << 16);			/* CBAR0: S1 translate, S2 bypass */
+	W(c + 0x38, 0x44);				/* MAIR0 attr0 = normal non-cacheable */
+	W(c + 0x3c, 0);
+	W(c + 0x10, 2);					/* TCR2: PASize 40 bit */
+	W(c + 0x30, 25 | (1u << 23));			/* TCR: T0SZ 25, TG0 4K, walks NC, EPD1 */
+	W(c + 0x20, (uint32_t)(uintptr_t)smmu_l1);	/* TTBR0 */
+	W(c + 0x24, (uint32_t)((uintptr_t)smmu_l1 >> 32));
+	W(c + 0x618, 0);				/* TLBIALL */
+	W(c + 0x7f0, 0);				/* TLBSYNC */
+	for (int i = 0; i < 1000 && (R(c + 0x7f4) & 1); i++)
+		udelay(1);
+	W(c + 0x0, (1u << 6) | (1u << 5) | (1u << 2) | (1u << 1) | 1);	/* CFIE CFRE AFE TRE M */
+	W(SMMU + 0xc00, 0);				/* S2CR0: translate, CB 0 */
+	W(SMMU + 0x800, smr0);
+	__asm__ volatile("dsb sy" ::: "memory");
+	con_hex2("SMMU cb0", "cbar=", R(SMMU + 0x1000), "sctlr=", R(c));
+	con_hex2("SMMU cb0", "ttbr0=", R(c + 0x20), "tcr=", R(c + 0x30));
+	con_hex2("SMMU map", "smr0=", R(SMMU + 0x800), "s2cr0=", R(SMMU + 0xc00));
+	int ok = !bad && R(SMMU + 0x800) == smr0 && (R(SMMU + 0xc00) & 0x300ff) == 0 && (R(c) & 1) &&
+		 R(c + 0x20) == (uint32_t)(uintptr_t)smmu_l1;
+	con_str("SMMU", ok ? "identity context bank 0 installed" : "hypervisor refused SMMU programming");
+	return ok;
+}
+
 static int smmu_bypass(void)
 {
 	uint32_t cr0 = R(SMMU + 0x0), idr0 = R(SMMU + 0x20), idr1 = R(SMMU + 0x24);
@@ -192,8 +230,7 @@ static int smmu_bypass(void)
 		uint32_t cbndx = s2cr & 0xff, type = (s2cr >> 16) & 3;
 		uint32_t sctlr = (type == 0 && cbndx < 8 && cb + (uintptr_t)cbndx * psz < SMMU + 0x10000) ?
 				 R(cb + (uintptr_t)cbndx * psz) : 0xffffffff;
-		con_hex2("SMR/S2CR",
-			 "smr=", smr, "s2cr=", s2cr);
+		(void)0;
 		if (smr >> 31) {		/* valid entry: id [15:0], mask [31:16] style (v2: mask [30:16]) */
 			uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
 			if (((0 ^ id) & ~mask & 0x7fff) == 0) {	/* matches stream 0 */
@@ -206,20 +243,19 @@ static int smmu_bypass(void)
 	int clientpd = cr0 & 1, usfcfg = (cr0 >> 10) & 1;
 	int ok = clientpd || (matched ? matched_bypass : !usfcfg);
 	if (!ok && !matched) {
-		/*
-		 * Nothing claims the GPU's streams and unmatched streams fault.
-		 * This SMMU serves only the GPU (TBUs gfx_0/gfx_1), so one rule
-		 * matching every stream id (mask 0x7fff) with S2CR type BYPASS
-		 * lets the GPU reach memory by physical address (stage 1 off).
-		 */
-		W(SMMU + 0xc00, 0x00010000);			/* S2CR0: TYPE = bypass */
-		W(SMMU + 0x800, 0x80000000u | (0x7fffu << 16));	/* SMR0: valid, id 0, mask all */
+		/* kgsl gfx3d_user = <&kgsl_smmu 0x0 0x400>: SID 0, mask 0x400 */
+		const uint32_t smr0 = 0x80000000u | (0x400u << 16);
+		/* (a) bypass */
+		W(SMMU + 0xc00, 0x00010000);
+		W(SMMU + 0x800, smr0);
 		__asm__ volatile("dsb sy" ::: "memory");
-		uint32_t smr = R(SMMU + 0x800), s2cr = R(SMMU + 0xc00);
-		con_hex2("SMMU set", "smr0=", smr, "s2cr0=", s2cr);
-		ok = !bad && (smr >> 31) && ((s2cr >> 16) & 3) == 1;
-		con_str("SMMU", ok ? "bypass rule for the GPU installed" : "hypervisor refused the bypass rule");
-		return ok;
+		con_hex2("SMMU bypass", "smr0=", R(SMMU + 0x800), "s2cr0=", R(SMMU + 0xc00));
+		if (R(SMMU + 0x800) == smr0 && ((R(SMMU + 0xc00) >> 16) & 3) == 1) {
+			con_str("SMMU", "bypass rule for SID 0 installed");
+			return 1;
+		}
+		/* (b) translate through context bank 0 with an identity stage-1 table */
+		return smmu_identity_cb0(cb, psz, smr0);
 	}
 	con_str("SMMU", clientpd ? "client port disabled: bypass" :
 		ok ? "GPU stream 0 bypasses translation" : "GPU stream is TRANSLATED or faults - CP test skipped");
@@ -312,6 +348,7 @@ static void cp_test(void)
 	con_hex2("CP", "hwfault=", R(GREG(0x821)), "int=", R(GREG(0x823)));
 	con_hex2("RBBM", "status=", R(GREG(0x210)), "int0=", R(GREG(0x201)));
 	con_hex2("MEM", "scratch=", scratch[0], "faults=", bad);
+	con_hex2("SMMU cb0", "fsr=", R(SMMU + 0x8000 + 0x58), "far=", R(SMMU + 0x8000 + 0x60));
 	W(GREG(0xf400), 0);				/* leave secure mode (no zap) */
 	con_hex("SECVID after", R(GREG(0xf400)));
 	con_str("GPU", scratch[0] == 0xC0FFEE01 ? "GPU EXECUTED COMMANDS AND WROTE MEMORY" :
@@ -320,7 +357,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8c: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8d: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
