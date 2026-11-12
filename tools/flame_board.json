@@ -1,14 +1,58 @@
 {
  "source": "stock vendor DT via i7m7r8/flame-mainline; re-run tools/flame-extract.py on the live DTB to confirm",
- "gic": ["0x17200000", "0x17260000"],
- "fb": ["0xb8000000", "0x2b00000"],
- "panel": [720, 1640],
- "ufs": ["0x1d84000", "0x3000"],
+ "gic": [
+  "0x17200000",
+  "0x17260000"
+ ],
+ "fb": [
+  "0xb8000000",
+  "0x2b00000"
+ ],
+ "panel": [
+  720,
+  1640
+ ],
+ "ufs": [
+  "0x1d84000",
+  "0x3000"
+ ],
  "wdt": "0x17410000",
- "xnu_ram": ["0x100000000", "0xc0000000"],
+ "xnu_ram": [
+  "0x100000000",
+  "0xc0000000"
+ ],
  "xnu_ram_note": "3 GiB above 4G (all vendor carve-outs are below 4G). The shim clamps this to the bank ABL reports, so 4 GB phones get less.",
  "tlmm": "0x0f100000",
- "touch": {"ic": "FocalTech FT8726 (TDDI)", "bus": "QUP0 SE1 geni-i2c @ 0x984000", "addr": "0x38", "irq_gpio": 13, "reset_gpio": 12, "coords": [1080, 2408]},
- "keys": {"power": "PMK8350 PON (SPMI SID 0)", "volume_down": "PMK8350 PON resin", "volume_up": "TLMM gpio 53, active low"},
- "spmi": {"cnfg": "0xc42d000", "core": "0xc400000", "chnls": "0xc500000", "obsrvr": "0xc440000", "intr": "0xc4c0000"}
+ "touch": {
+  "bus": "QUP0 SE1 geni-SPI @ 0x984000 (qupv3_se1_spi), CS0, 9.6 MHz",
+  "ic": "Novatek NT36xxx (BOE/TXD/Xinli/XL7 panels) or FocalTech FT8057M (HKC panel); probe chip id",
+  "irq_gpio": 34,
+  "reset_gpio": 98,
+  "coords": [
+   720,
+   1640
+  ],
+  "fw": "/odm/firmware/novatek_ts_fw_<vendor>.bin or focaltech_ts_fw_hkc.bin (proprietary, kept in research/touchfw)",
+  "panels": [
+   "c3f_35_02_0d",
+   "c3f_37_02_0b",
+   "c3f_43_02_0a",
+   "c3f_43_02_0g",
+   "c3f_46_03_0c"
+  ],
+  "panel_from": "ABL bootargs msm_drm.dsi_display0=...",
+  "note": "focaltech@38 on i2c@984000 / FT8726 in flame-mainline is the Qualcomm QRD leftover, not the real phone"
+ },
+ "keys": {
+  "power": "PMK8350 PON (SPMI SID 0)",
+  "volume_down": "PMK8350 PON resin",
+  "volume_up": "TLMM gpio 53, active low"
+ },
+ "spmi": {
+  "cnfg": "0xc42d000",
+  "core": "0xc400000",
+  "chnls": "0xc500000",
+  "obsrvr": "0xc440000",
+  "intr": "0xc4c0000"
+ }
 }
