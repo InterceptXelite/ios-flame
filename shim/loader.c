@@ -100,6 +100,23 @@ static void adt_set_u64(uintptr_t adt, uint64_t len, const char *name, uint64_t 
 	con_str("ADT", "property not found (kernel uses boot_args)");
 }
 
+#define PANIC_LOG_BYTES 0x100000UL	/* tools/mkadt.py PANIC_LOG_SIZE */
+
+/* /pram reg = <u64 base, u64 size>: find the 16-byte pattern and rewrite it. */
+static void adt_move_pram(uintptr_t adt, uint64_t len, uint64_t old_base, uint64_t new_base)
+{
+	for (uint64_t o = 0; o + 16 <= len; o += 4) {
+		volatile uint32_t *w = (volatile uint32_t *)(adt + o);
+		if (w[0] == (uint32_t)old_base && w[1] == (uint32_t)(old_base >> 32) &&
+		    w[2] == (uint32_t)PANIC_LOG_BYTES && w[3] == 0) {
+			w[0] = (uint32_t)new_base;
+			w[1] = (uint32_t)(new_base >> 32);
+			return;
+		}
+	}
+	con_str("ADT", "/pram reg not found");
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -166,6 +183,7 @@ const char *loader_boot(uintptr_t dtb)
 	}
 	if (phys + mem_size > bank_b + bank_s)
 		mem_size = (bank_b + bank_s - phys) & ~(PAGE_16K - 1);
+	mem_size -= PANIC_LOG_BYTES;	/* keep 1 MiB of this bank for /pram */
 	if (mem_size < 0x30000000UL)
 		return "DRAM bank < 768 MiB for XNU";
 	uint64_t pa_of_va_base = phys - p->virt_base;	/* pa = va + this */
@@ -195,6 +213,13 @@ const char *loader_boot(uintptr_t dtb)
 	 * u32 length, value; values are only 4-byte aligned -> two 32-bit stores. */
 	adt_set_u64(adt_pa, p->adt_size, "dram-base", phys);
 	adt_set_u64(adt_pa, p->adt_size, "dram-size", mem_size);
+	/* /pram (panic log) was placed by mkadt right after the build-time RAM
+	 * (p->phys_base + p->mem_size). On flame that address fell into the hole
+	 * between two DRAM banks -> "Unclassified kernel abort (fault_code=0x10)"
+	 * right after kprintf init. Move it to the 1 MiB just above our RAM,
+	 * which is still inside the chosen bank (mem_size was trimmed for it). */
+	adt_move_pram(adt_pa, p->adt_size, p->phys_base + p->mem_size, phys + mem_size);
+	con_hex("PRAM", phys + mem_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
