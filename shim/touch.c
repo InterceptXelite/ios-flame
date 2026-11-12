@@ -164,7 +164,7 @@ static int spi_frame(const uint8_t *tx, uint8_t *rx, uint32_t n)
 	wr(SE + SE_GENI_M_IRQ_CLEAR, 0xffffffff);
 	wr(SE + SE_SPI_TX_LEN, n);
 	wr(SE + SE_SPI_RX_LEN, n);
-	wr(SE + SE_GENI_M_CMD0, (7u << 27) | (1u << 2));	/* SPI_TX_RX, FRAGMENTATION */
+	wr(SE + SE_GENI_M_CMD0, (3u << 27) | (1u << 2));	/* FULL DUPLEX (TX_ONLY|RX_ONLY), FRAGMENTATION. 7 = TX then RX! */
 	for (uint32_t i = 0; i < n; i += 4) {
 		uint32_t w = 0;
 		for (uint32_t b = 0; b < 4 && i + b < n; b++)
@@ -363,7 +363,7 @@ static int se_spi_setup(void)
 
 void test_touch(uintptr_t dtb)
 {
-	con_str("SHIM", "ios-flame stage 6e: touch diagnostics");
+	con_str("SHIM", "ios-flame stage 6f: touch diagnostics");
 	con_skip();
 	find_panel(dtb);
 	int novatek = has(panel, "c3f_35") || has(panel, "c3f_37") || has(panel, "c3f_43");
