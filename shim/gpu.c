@@ -175,17 +175,35 @@ static uint32_t sqe[16384] __attribute__((aligned(4096)));	/* 64 KiB */
 static uint32_t ring[8192] __attribute__((aligned(32768)));	/* 32 KiB */
 static volatile uint32_t scratch[1024] __attribute__((aligned(4096)));
 
+
+/*
+ * The shim runs with the MMU (and so the D-cache) off, but ABL ran with caches
+ * on and may have left lines for our .bss in the caches. The SMMU walker and
+ * the GPU are IO-coherent ("dma-coherent"): they would read those stale lines
+ * instead of what we wrote to DRAM. Clean+invalidate by address to the PoC
+ * before and after filling any buffer the GPU or SMMU reads.
+ */
+static void dcache_flush(const volatile void *p, uint64_t len)
+{
+	uintptr_t a = (uintptr_t)p & ~63UL, e = (uintptr_t)p + len;
+	for (; a < e; a += 64)
+		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 /* stage-1 identity map, 1 GiB blocks, 39-bit VA (3-level, start at L1) */
 static uint64_t smmu_l1[512] __attribute__((aligned(4096)));
 
 static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 {
 	(void)psz;
+	dcache_flush(smmu_l1, sizeof(smmu_l1));
 	for (int i = 0; i < 512; i++)
 		smmu_l1[i] = 0;
 	for (uint64_t g = 0; g < 16; g++)		/* PA 0 .. 16 GiB */
 		smmu_l1[g] = (g << 30) | (1u << 10) | (3u << 8) | (1u << 6) | 1;	/* AF, inner-sh, AP=RW all, block, attr0 */
 	__asm__ volatile("dsb sy" ::: "memory");
+	dcache_flush(smmu_l1, sizeof(smmu_l1));
 	uintptr_t c = cb;				/* context bank 0 */
 	/* every step is announced first: a hang shows which access stalled */
 	con_str("CB step 1", "read CBAR0/CBA2R0 (GR1 page)");
@@ -315,6 +333,9 @@ static void cp_test(void)
 		con_hex("SQE fw missing, len", fwlen);
 		return;
 	}
+	dcache_flush(sqe, sizeof(sqe));
+	dcache_flush(ring, sizeof(ring));
+	dcache_flush(scratch, sizeof(scratch));
 	const volatile uint8_t *f = gpu_fw_start;
 	for (uint32_t i = 0; i + 4 < fwlen + 4 && 4 + i < fwlen; i += 4)
 		sqe[i / 4] = f[4 + i] | f[5 + i] << 8 | f[6 + i] << 16 | (uint32_t)f[7 + i] << 24;
@@ -369,11 +390,14 @@ static void cp_test(void)
 	ring[n++] = 0xC0FFEE01;
 	ring[n++] = pkt7(16, 0);			/* CP_NOP pad */
 	__asm__ volatile("dsb sy" ::: "memory");
+	dcache_flush(sqe, sizeof(sqe));
+	dcache_flush(ring, sizeof(ring));
+	dcache_flush(scratch, sizeof(scratch));
 	W(GREG(0x807), n);				/* CP_RB_WPTR */
 
 	uint64_t end = ticks() + 19200ULL * 500;
 	while (ticks() < end && scratch[0] != 0xC0FFEE01)
-		;
+		dcache_flush(scratch, 64);	/* the GPU may write into the caches */
 	con_hex2("CP", "rptr=", R(GREG(0x806)), "wptr=", n);
 	con_hex2("CP", "hwfault=", R(GREG(0x821)), "int=", R(GREG(0x823)));
 	con_hex2("RBBM", "status=", R(GREG(0x210)), "int0=", R(GREG(0x201)));
@@ -387,7 +411,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8g: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8h: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
