@@ -8,3 +8,6 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# build outputs
+flame-ios-boot.img
+*.img
