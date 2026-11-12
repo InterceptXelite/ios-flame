@@ -11,3 +11,4 @@ __pycache__/
 # build outputs
 flame-ios-boot.img
 *.img
+tools/zbm/*.so
