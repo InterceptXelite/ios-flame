@@ -95,6 +95,12 @@ static int gpu_power(void)
 	/* GPU_CC CX side */
 	int ok_cx = branch_on(GPUCC + 0x911c) & branch_on(GPUCC + 0x9144) & branch_on(GPUCC + 0x9148);
 	con_hex2("CLOCKS", "noc=", ok_noc, "cx=", ok_cx);
+	/* SMMU (TCU/context banks) clocks, from gpucc-ravelin.c: hlos1 vote (voted, no
+	 * reliable halt bit) and cx_gmu (gmu RCG left on its XO default) */
+	setbits(GPUCC + 0x7000, 1);
+	udelay(50);
+	int ok_smmu = branch_on(GPUCC + 0x913c);
+	con_hex2("SMMU CLK", "hlos1vote=", R(GPUCC + 0x7000), "cxgmu=", R(GPUCC + 0x913c) | (uint32_t)ok_smmu << 4);
 
 	/* CX GDSC (votable): clear SW_COLLAPSE, wait PWR_ON */
 	clrbits(GPUCC + 0x9108, 1);
@@ -366,7 +372,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8e: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8f: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
