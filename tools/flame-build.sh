@@ -17,7 +17,7 @@ CPUS="${2:-1}"   # start with 1 core; 6 once the kernel is stable on flame
 
 # sweet-only hardware drivers stay OFF on flame until the flame drivers exist:
 #   sweettouch=0  (Goodix on sweet's I2C bus + RPMh vote at sweet addresses)
-#   sweetkeys=0   (SPMI arb v5 at sweet addresses; flame has arb v7)
+#   sweetkeys     now the flame driver (patch 0093), on by default
 #   sweetusb=0
 FLAME_OFF="sweettouch=0 sweetkeys=${KEYS:-1} sweetusb=0"   # KEYS=0 to disable the flame key driver (patch 0093)
 # MODE=safe (default): READ-ONLY. userdata still holds Android: no ufsrw, no
