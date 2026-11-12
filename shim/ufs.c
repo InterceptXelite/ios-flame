@@ -540,7 +540,6 @@ void log_view(void)
 				found = b;
 		}
 		con_hex2("search", "found lba=", found, "rel=", found ? found - (uint32_t)first : 0);
-		con_hex2("HFS hdr", "blk1 sig=", 0, "", 0);
 		if (!read_blocks((uint32_t)first, 1, data))
 			con_hex2("HFS hdr", "sig@1024=", data[1024] << 8 | data[1025], "blocks@1064=",
 				 (uint32_t)data[1064] << 24 | data[1065] << 16 | data[1066] << 8 | data[1067]);
