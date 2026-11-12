@@ -81,8 +81,6 @@ static void state(const char *tag)
 
 static int gpu_power(void)
 {
-	con_hex2("BEFORE", "cxgdsc=", R(GPUCC + 0x9108), "gxgdsc=", R(GPUCC + 0x905c));
-	con_hex("  probe faults", bad);
 	if (bad) {
 		con_str("GPU", "GPU_CC not readable from EL1 - stop");
 		return -1;
@@ -127,7 +125,6 @@ static int gpu_power(void)
 	udelay(1);
 	setbits(GPUCC + 0x905c, 1u << 11);		/* retain FF */
 	con_hex2("GX GDSC", "on=", gx_on, "reg=", R(GPUCC + 0x905c));
-	con_hex2("GX GDSC", "cfg=", R(GPUCC + 0x9060), "faults=", bad);
 	if (!gx_on || bad) {
 		con_str("GPU", "GX GDSC did not power up - stop");
 		state("NOW");
@@ -162,8 +159,6 @@ static int gpu_alive(void)
 	W(GREG(0x884), 0x9abcdef0);
 	uint32_t s0 = R(GREG(0x883)), s1 = R(GREG(0x884));
 	con_hex2("CP SCRATCH", "0=", s0, "1=", s1);
-	con_hex2("CP", "sqe_cntl=", R(GREG(0x808)), "secvid=", R(GREG(0xf400)));
-	con_hex2("RBBM", "int0=", R(GREG(0x201)), "faults=", bad);
 	int ok = s0 == 0x12345678 && s1 == 0x9abcdef0;
 	con_str("GPU", ok ? "ADRENO 613 ALIVE (registers respond)" : "GPU registers do not hold values");
 	return ok ? 0 : -1;
@@ -174,10 +169,11 @@ static int gpu_alive(void)
 #define SMMU	0x03da0000UL
 extern const uint8_t gpu_fw_start[], gpu_fw_end[];
 
+
+
 static uint32_t sqe[16384] __attribute__((aligned(4096)));	/* 64 KiB */
 static uint32_t ring[8192] __attribute__((aligned(32768)));	/* 32 KiB */
 static volatile uint32_t scratch[1024] __attribute__((aligned(4096)));
-
 
 /* stage-1 identity map, 1 GiB blocks, 39-bit VA (3-level, start at L1) */
 static uint64_t smmu_l1[512] __attribute__((aligned(4096)));
@@ -197,7 +193,6 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	con_hex2("  GR1", "cbar0=", cbar, "cba2r0=", cba2r);
 	con_str("CB step 2", "read CB0 SCTLR/TCR/FSR");
 	con_hex2("  CB0", "sctlr=", R(c + 0x0), "tcr=", R(c + 0x30));
-	con_hex2("  CB0", "fsr=", R(c + 0x58), "faults=", bad);
 	con_str("CB step 3", "write CBA2R0, CBAR0");
 	W(SMMU + 0x1800, 1);				/* CBA2R0: VA64 */
 	W(SMMU + 0x1000, 1u << 16);			/* CBAR0: S1 translate, S2 bypass */
@@ -209,8 +204,17 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	W(c + 0x30, 25 | (1u << 23));			/* TCR: T0SZ 25, TG0 4K, walks NC, EPD1 */
 	W(c + 0x20, (uint32_t)(uintptr_t)smmu_l1);	/* TTBR0 */
 	W(c + 0x24, (uint32_t)((uintptr_t)smmu_l1 >> 32));
-	con_str("CB step 5", "TLB invalidate (no sync wait)");
-	W(c + 0x618, 0);				/* TLBIALL */
+	con_str("CB step 5", "TLB invalidate + sync (CB and global)");
+	W(c + 0x58, R(c + 0x58));			/* clear stale FSR */
+	W(c + 0x618, 0);				/* CB TLBIALL */
+	W(c + 0x7f0, 0);				/* CB TLBSYNC */
+	for (int i = 0; i < 2000 && (R(c + 0x7f4) & 1); i++)
+		udelay(1);
+	W(SMMU + 0x68, 0);				/* sTLBIALLNSNH */
+	W(SMMU + 0x70, 0);				/* sTLBGSYNC */
+	for (int i = 0; i < 2000 && (R(SMMU + 0x74) & 1); i++)
+		udelay(1);
+	con_hex2("  sync", "cb=", R(c + 0x7f4), "global=", R(SMMU + 0x74));
 	con_str("CB step 6", "SCTLR enable");
 	W(c + 0x0, (1u << 6) | (1u << 5) | (1u << 2) | (1u << 1) | 1);	/* CFIE CFRE AFE TRE M */
 	con_str("CB step 7", "S2CR0 -> translate CB0");
@@ -223,6 +227,17 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	int ok = !bad && R(SMMU + 0x800) == smr0 && (R(SMMU + 0xc00) & 0x300ff) == 0 && (R(c) & 1) &&
 		 R(c + 0x20) == (uint32_t)(uintptr_t)smmu_l1;
 	con_str("SMMU", ok ? "identity context bank 0 installed" : "hypervisor refused SMMU programming");
+	if (ok) {
+		/* ask the SMMU itself to translate the SQE buffer address (ATS1PR) */
+		uint64_t va = (uintptr_t)sqe;
+		W(c + 0x800, (uint32_t)va & ~0xfffu);
+		W(c + 0x804, (uint32_t)(va >> 32));
+		int i = 0;
+		while (i++ < 2000 && (R(c + 0x8f0) & 1))
+			udelay(1);
+		con_hex2("ATS1 sqe", "par_lo=", R(c + 0x50), "par_hi=", R(c + 0x54));
+		con_hex2("ATS1", "atsr=", R(c + 0x8f0), "fsr=", R(c + 0x58));
+	}
 	return ok;
 }
 
@@ -372,7 +387,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8f: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8g: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
