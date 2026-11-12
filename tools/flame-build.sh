@@ -29,6 +29,8 @@ if [ "$MODE" = ios ]; then
 else
 	RW="sweetlog=0"
 fi
+# NOCON=1: stop drawing kernel text over the iOS GUI (panics are still drawn)
+[ "${NOCON:-0}" = 1 ] && RW="$RW sweetfb_noconsole=1"
 B="debug=0xc serial=3 cpus=$CPUS keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin $RW launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 $FLAME_OFF"
 echo "mode: $MODE  ($RW)"
 
