@@ -193,6 +193,7 @@ static void dcache_flush(const volatile void *p, uint64_t len)
 
 /* stage-1 identity map, 1 GiB blocks, 39-bit VA (3-level, start at L1) */
 static uint64_t smmu_l1[512] __attribute__((aligned(4096)));
+static uint64_t smmu_l2[4][512] __attribute__((aligned(4096)));
 
 static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 {
@@ -200,10 +201,16 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	dcache_flush(smmu_l1, sizeof(smmu_l1));
 	for (int i = 0; i < 512; i++)
 		smmu_l1[i] = 0;
-	for (uint64_t g = 0; g < 16; g++)		/* PA 0 .. 16 GiB */
-		smmu_l1[g] = (g << 30) | (1u << 10) | (3u << 8) | (1u << 6) | 1;	/* AF, inner-sh, AP=RW all, block, attr0 */
+	/* 2 MiB blocks only (no 1 GiB L1 blocks): L1[2..5] -> L2 tables, PA 2..6 GiB */
+	dcache_flush(smmu_l2, sizeof(smmu_l2));
+	for (uint64_t t = 0; t < 4; t++) {
+		for (uint64_t i = 0; i < 512; i++)
+			smmu_l2[t][i] = (((2 + t) << 30) + (i << 21)) | (1u << 10) | (3u << 8) | (1u << 6) | 1;
+		smmu_l1[2 + t] = (uintptr_t)smmu_l2[t] | 3;	/* table descriptor */
+	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	dcache_flush(smmu_l1, sizeof(smmu_l1));
+	dcache_flush(smmu_l2, sizeof(smmu_l2));
 	uintptr_t c = cb;				/* context bank 0 */
 	/* every step is announced first: a hang shows which access stalled */
 	con_str("CB step 1", "read CBAR0/CBA2R0 (GR1 page)");
@@ -216,10 +223,10 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	W(SMMU + 0x1000, 1u << 16);			/* CBAR0: S1 translate, S2 bypass */
 	con_hex2("  GR1", "cbar0=", R(SMMU + 0x1000), "cba2r0=", R(SMMU + 0x1800));
 	con_str("CB step 4", "write CB0 MAIR/TCR2/TCR/TTBR0");
-	W(c + 0x38, 0x44);				/* MAIR0 attr0 = normal non-cacheable */
+	W(c + 0x38, 0xff);				/* MAIR0 attr0 = normal write-back */
 	W(c + 0x3c, 0);
 	W(c + 0x10, 2);					/* TCR2: PASize 40 bit */
-	W(c + 0x30, 25 | (1u << 23));			/* TCR: T0SZ 25, TG0 4K, walks NC, EPD1 */
+	W(c + 0x30, 25 | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23));	/* TCR: T0SZ 25, 4K, walks WB IS, EPD1 */
 	W(c + 0x20, (uint32_t)(uintptr_t)smmu_l1);	/* TTBR0 */
 	W(c + 0x24, (uint32_t)((uintptr_t)smmu_l1 >> 32));
 	con_str("CB step 5", "TLB invalidate + sync (CB and global)");
@@ -245,17 +252,6 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	int ok = !bad && R(SMMU + 0x800) == smr0 && (R(SMMU + 0xc00) & 0x300ff) == 0 && (R(c) & 1) &&
 		 R(c + 0x20) == (uint32_t)(uintptr_t)smmu_l1;
 	con_str("SMMU", ok ? "identity context bank 0 installed" : "hypervisor refused SMMU programming");
-	if (ok) {
-		/* ask the SMMU itself to translate the SQE buffer address (ATS1PR) */
-		uint64_t va = (uintptr_t)sqe;
-		W(c + 0x800, (uint32_t)va & ~0xfffu);
-		W(c + 0x804, (uint32_t)(va >> 32));
-		int i = 0;
-		while (i++ < 2000 && (R(c + 0x8f0) & 1))
-			udelay(1);
-		con_hex2("ATS1 sqe", "par_lo=", R(c + 0x50), "par_hi=", R(c + 0x54));
-		con_hex2("ATS1", "atsr=", R(c + 0x8f0), "fsr=", R(c + 0x58));
-	}
 	return ok;
 }
 
@@ -403,6 +399,8 @@ static void cp_test(void)
 	con_hex2("RBBM", "status=", R(GREG(0x210)), "int0=", R(GREG(0x201)));
 	con_hex2("MEM", "scratch=", scratch[0], "faults=", bad);
 	con_hex2("SMMU cb0", "fsr=", R(SMMU + 0x8000 + 0x58), "far=", R(SMMU + 0x8000 + 0x60));
+	con_hex2("SMMU cb0", "fsynr0=", R(SMMU + 0x8000 + 0x68), "fsynr1=", R(SMMU + 0x8000 + 0x6c));
+	con_hex2("SMMU", "cbfrsynra0=", R(SMMU + 0x1400), "gfsr=", R(SMMU + 0x48));
 	W(GREG(0xf400), 0);				/* leave secure mode (no zap) */
 	con_hex("SECVID after", R(GREG(0xf400)));
 	con_str("GPU", scratch[0] == 0xC0FFEE01 ? "GPU EXECUTED COMMANDS AND WROTE MEMORY" :
@@ -411,7 +409,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8h: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8i: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
