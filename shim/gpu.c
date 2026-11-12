@@ -225,7 +225,7 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	con_str("CB step 4", "write CB0 MAIR/TCR2/TCR/TTBR0");
 	W(c + 0x38, 0xff);				/* MAIR0 attr0 = normal write-back */
 	W(c + 0x3c, 0);
-	W(c + 0x10, 2);					/* TCR2: PASize 40 bit */
+	W(c + 0x10, 2 | (7u << 15));			/* TCR2: PASize 40 bit, SEP = upstream (else VA bit 31 picks TTBR1!) */
 	W(c + 0x30, 25 | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23));	/* TCR: T0SZ 25, 4K, walks WB IS, EPD1 */
 	W(c + 0x20, (uint32_t)(uintptr_t)smmu_l1);	/* TTBR0 */
 	W(c + 0x24, (uint32_t)((uintptr_t)smmu_l1 >> 32));
@@ -409,7 +409,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8i: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8j: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
