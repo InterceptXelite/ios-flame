@@ -128,3 +128,18 @@ Rules for ALL flame code (shim and XNU drivers): plain MMIO accessors only (GIC 
 | **3e** | **PASS**: BSD, MAC, AMFI, IOKit platform expert, AKS, WDT, HID, battery, `AppleCLCD 720x1640 ... presented as 1125x2436`, UFS driver, `BSD root: ufsroot0` → userdata read; `unknown Volume Signature: 671a` (encrypted Android f2fs), `cannot mount root, errno = 19` loop | **expected end of stage 3** (no iOS root yet). Read-only mode, nothing written |
 
 **Stage 3 complete (2026-11-12).** Next: stage 4, the iOS root image in userdata (erases Android data, needs confirmation).
+
+## Stage 4/5 (iOS root on flame)
+
+- **Root image built without mounting** (`tools/flame-iosroot.py`): iOS 16.7.16 (20H392) iPhone X
+  OS + SystemOS/AppOS cryptexes read with 7-Zip (sealed APFS), LZBITMAP decoded by `tools/zbm`
+  (code-signature checked), mkiosroot.sh + sweet-root-tweaks.py applied on the tree, HFSX written
+  by `tools/hfsbuild.py` as an Android sparse image (100 GiB volume, 14.7 GB stream, 43 x 350 MiB
+  parts, SHA-256 b8575f4f...3830). `tools/verify-simg.py`: fsck OK, 1512 files byte-identical, tweaks present.
+- Flashed with `fastboot flash userdata` (2026-11-12, sparse 1/46.., OK).
+- **First iOS boot (flame-stage5-ios-rw, cpus=1):** root mounted, launchd up, ~300 daemons,
+  **SpringBoard[26] + backboardd running, no crash**; bluetoothd/fairplayd.H2 relaunch (no hardware,
+  same as sweet); backboardd polls IOAcceleratorES (no GPU); Apple logo = data migration (sweet: ~60 min on 1 CPU).
+- Next: `NOCON=1` images (`sweetfb_noconsole=1`), cpus=6 (untested on flame) and cpus=1.
+- Known risk: the HFS volume is not journaled; unclean reboots during writes can corrupt it
+  (sweet saw this). Re-flash the image if hfs errors appear; journaling is a TODO in hfsbuild.

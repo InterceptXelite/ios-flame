@@ -356,6 +356,11 @@ def build(root, out_path, volume_bytes, name='iOSRoot', progress=print, part_byt
         n.start, n.blocks = (pos, nb) if nb else (0, 0)
         pos += nb
     data_end = pos
+    if os.environ.get('HFS_LAYOUT'):
+        with open(os.environ['HFS_LAYOUT'], 'w', errors='surrogateescape') as lf:
+            for n in files:
+                if n.blocks and isinstance(n, File):
+                    lf.write('%d\t%d\t%d\t%s\n' % (n.start, n.blocks, n.size, getattr(n, 'label', '')))
     if data_end + 1 > total_blocks:
         raise SystemExit('volume too small: need %d blocks, have %d' % (data_end + 1, total_blocks))
     used_blocks = data_end + 1                # + last block (alternate header)
