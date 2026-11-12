@@ -157,39 +157,53 @@ static int spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
 	return r;
 }
 
-static int spi_frame(const uint8_t *tx, uint8_t *rx, uint32_t n)
+/*
+ * One frame, streaming through the FIFOs so it can be longer than they are.
+ * The bytes sent are: hdr[0..nh-1] then data[0..n-nh-1] (data may be NULL = zeros).
+ * rx (may be NULL) receives all n bytes (full duplex); without rx it is TX only.
+ */
+static int spi_stream(const uint8_t *hdr, uint32_t nh, const volatile uint8_t *data,
+		      uint8_t *rx, uint32_t n)
 {
-	if (n == 0 || n > fifo_words * 4)
-		return -1;
+	uint32_t op = rx ? 3 : 1;
 	wr(SE + SE_GENI_M_IRQ_CLEAR, 0xffffffff);
 	wr(SE + SE_SPI_TX_LEN, n);
-	wr(SE + SE_SPI_RX_LEN, n);
-	wr(SE + SE_GENI_M_CMD0, (3u << 27) | (1u << 2));	/* FULL DUPLEX (TX_ONLY|RX_ONLY), FRAGMENTATION. 7 = TX then RX! */
-	for (uint32_t i = 0; i < n; i += 4) {
-		uint32_t w = 0;
-		for (uint32_t b = 0; b < 4 && i + b < n; b++)
-			w |= (uint32_t)tx[i + b] << (8 * b);
-		wr(SE + SE_GENI_TX_FIFO, w);
-	}
-	uint32_t got = 0;
-	uint64_t end = ticks() + 19200 * 50;		/* 50 ms */
+	if (rx)
+		wr(SE + SE_SPI_RX_LEN, n);
+	wr(SE + SE_GENI_M_CMD0, (op << 27) | (1u << 2));	/* 3 = full duplex, 1 = TX only; FRAGMENTATION */
+	uint32_t ti = 0, got = 0;
+	uint64_t end = ticks() + 19200 * (50 + n / 256);
 	while (ticks() < end) {
-		uint32_t st = rd(SE + SE_GENI_RX_FIFO_ST);
-		uint32_t wc = st & 0x1ffffff;
-		while (wc-- && got < n) {
-			uint32_t w = rd(SE + SE_GENI_RX_FIFO);
-			for (uint32_t b = 0; b < 4 && got < n; b++)
-				rx[got++] = w >> (8 * b);
+		while (ti < n && (rd(SE + SE_GENI_TX_FIFO_ST) & 0x0fffffff) < fifo_words) {
+			uint32_t w = 0;
+			for (uint32_t k = 0; k < 4 && ti < n; k++, ti++) {
+				uint8_t c = ti < nh ? hdr[ti] : data ? data[ti - nh] : 0;
+				w |= (uint32_t)c << (8 * k);
+			}
+			wr(SE + SE_GENI_TX_FIFO, w);
+		}
+		if (rx) {
+			uint32_t wc = rd(SE + SE_GENI_RX_FIFO_ST) & 0x1ffffff;
+			while (wc-- && got < n) {
+				uint32_t w = rd(SE + SE_GENI_RX_FIFO);
+				for (uint32_t k = 0; k < 4 && got < n; k++)
+					rx[got++] = w >> (8 * k);
+			}
 		}
 		uint32_t irq = rd(SE + SE_GENI_M_IRQ_STATUS);
-		if ((irq & 1) && got >= n) {
+		if ((irq & 1) && ti >= n && (!rx || got >= n)) {
 			wr(SE + SE_GENI_M_IRQ_CLEAR, irq);
 			return 0;
 		}
 	}
 	con_hex2("SPI TIMEOUT", "irq=", rd(SE + SE_GENI_M_IRQ_STATUS), "got=", got);
-	con_hex2("SPI ST", "geni=", rd(SE + SE_GENI_STATUS), "rxst=", rd(SE + SE_GENI_RX_FIFO_ST));
+	con_hex2("SPI ST", "n=", n, "ti=", ti);
 	return -1;
+}
+
+static int spi_frame(const uint8_t *tx, uint8_t *rx, uint32_t n)
+{
+	return spi_stream(tx, n, 0, rx, n);
 }
 
 static int nvt_write(uint8_t *buf, uint32_t n)
@@ -231,7 +245,7 @@ static int nvt_write_addr(uint32_t a, uint8_t v)
 static uint32_t le4(const uint8_t *b) { return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
 
 /* protocol self-test: write a pattern to SRAM, read it back; dump the trim area */
-static void nvt_rw_test(const char *tag)
+static void __attribute__((unused)) nvt_rw_test(const char *tag)
 {
 	nvt_write_addr(0x3F0FE, 0x69);			/* bootloader reset (NT36528A) */
 	delay_ms(5);
@@ -276,6 +290,220 @@ static void nvt_probe(void)
 		}
 	}
 	con_str("TOUCH", "no Novatek id matched");
+}
+
+
+/* ---- NT36528A firmware download (hw CRC flow of nt36xxx_fw_update.c) ---- */
+
+extern const uint8_t touch_fw_start[], touch_fw_end[];
+
+#define EVENT_BUF	0x22D00
+#define BOOT_RDY	0x3F10D
+#define ILM_DES		0x3F128
+#define DLM_DES		0x3F12C
+#define ILM_LEN		0x3F118
+#define DLM_LEN		0x3F130
+#define G_ILM_CRC	0x3F100
+#define G_DLM_CRC	0x3F104
+#define R_ILM_CRC	0x3F120
+#define R_DLM_CRC	0x3F124
+#define CRC_FLAG	0x3F133
+
+struct part { uint32_t sram, size, bin, crc; };
+static struct part parts[24];
+static uint32_t nparts;
+
+static uint32_t fw4(const volatile uint8_t *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static int fw_parse(const volatile uint8_t *fw, uint32_t fwsize)
+{
+	uint32_t end = fw4(fw);
+	if ((fw[0x20] & 2) || end < 0x30 || end > 0x1000) {
+		con_hex2("FW", "bad header end=", end, "casc=", fw[0x20]);
+		return -1;
+	}
+	uint32_t info = 0;
+	for (uint32_t pos = 0x30; pos < end; pos += 0x10)
+		info++;
+	uint32_t ovly = (fw[0x28] & 0x10) ? (fw[0x28] & 0x0f) : 0;
+	nparts = 2 + info + ovly;
+	if (nparts > 24)
+		return -1;
+	for (uint32_t i = 0; i < nparts; i++) {
+		struct part *p = &parts[i];
+		if (i < 2) {
+			p->bin = fw4(fw + 12 * i);
+			p->sram = fw4(fw + 4 + 12 * i);
+			p->size = fw4(fw + 8 + 12 * i);
+			p->crc = fw4(fw + 0x18 + 4 * i);
+		} else {
+			uint32_t pos = i < 2 + info ? 0x30 + 0x10 * (i - 2)
+						    : parts[1].bin + 0x10 * (i - 2 - info);
+			p->sram = fw4(fw + pos);
+			p->size = fw4(fw + pos + 4);
+			p->bin = fw4(fw + pos + 8);
+			p->crc = fw4(fw + pos + 12);
+		}
+		if (p->bin + p->size > fwsize) {
+			con_hex2("FW part too big", "i=", i, "bin=", p->bin);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int nvt_write_sram(uint32_t sram, const volatile uint8_t *src, uint32_t size)
+{
+	while (size) {
+		uint32_t len = size > 4096 ? 4096 : size;
+		uint8_t hdr = (sram & 0x7f) | 0x80;
+		if (nvt_set_page(sram))
+			return -1;
+		if (spi_cmd(8))
+			return -1;
+		int r = spi_stream(&hdr, 1, src, 0, len + 1);
+		spi_cmd(9);
+		udelay(5);
+		if (r)
+			return -1;
+		sram += len;
+		src += len;
+		size -= len;
+	}
+	return 0;
+}
+
+static void nvt_crc_bank(uint32_t des, uint32_t sram, uint32_t lenaddr, uint32_t size,
+			 uint32_t gaddr, uint32_t crc)
+{
+	nvt_set_page(des);
+	uint8_t b[5];
+	b[0] = des & 0x7f; b[1] = sram; b[2] = sram >> 8; b[3] = sram >> 16;
+	nvt_write(b, 4);
+	b[0] = lenaddr & 0x7f; b[1] = size; b[2] = size >> 8; b[3] = size >> 16;
+	nvt_write(b, 4);
+	b[0] = gaddr & 0x7f; b[1] = crc; b[2] = crc >> 8; b[3] = crc >> 16; b[4] = crc >> 24;
+	nvt_write(b, 5);
+}
+
+static uint32_t nvt_rd32(uint32_t addr)
+{
+	nvt_set_page(addr);
+	uint8_t b[5] = {addr & 0x7f};
+	nvt_read(b, 5);
+	return b[1] | b[2] << 8 | b[3] << 16 | (uint32_t)b[4] << 24;
+}
+
+static int nvt_download(void)
+{
+	const volatile uint8_t *fw = touch_fw_start;
+	uint32_t fwsize = touch_fw_end - touch_fw_start;
+	con_hex2("FW", "size=", fwsize, "ver=", fwsize >= 0x1000 ? fw[fwsize - 0x1000] : 0);
+	if (fwsize < 0x10000 || fw_parse(fw, fwsize))
+		return -1;
+	con_hex2("FW ILM", "size=", parts[0].size, "crc=", parts[0].crc);
+	con_hex2("FW DLM", "size=", parts[1].size, "crc=", parts[1].crc);
+	con_hex("FW parts", nparts);
+
+	for (int attempt = 0; attempt < 3; attempt++) {
+		uint64_t t0 = ticks();
+		nvt_write_addr(0x3F0FE, 0x69);		/* bootloader reset */
+		delay_ms(5);
+		nvt_crc_bank(ILM_DES, parts[0].sram, ILM_LEN, parts[0].size, G_ILM_CRC, parts[0].crc);
+		nvt_crc_bank(DLM_DES, parts[1].sram, DLM_LEN, parts[1].size, G_DLM_CRC, parts[1].crc);
+		int bad = 0;
+		for (uint32_t i = 0; i < nparts && !bad; i++)
+			if (parts[i].size)
+				bad = nvt_write_sram(parts[i].sram, fw + parts[i].bin, parts[i].size + 1);
+		if (bad) {
+			con_str("FW", "SRAM write failed");
+			continue;
+		}
+		/* clear reset status, enable fw crc */
+		nvt_set_page(EVENT_BUF);
+		uint8_t c[7] = {0x60, 0, 0, 0, 0, 0, 0};
+		nvt_write(c, 7);
+		uint8_t e[3] = {0x50, 0xAE, 0x00};
+		nvt_write(e, 3);
+		nvt_write_addr(BOOT_RDY, 1);		/* boot ready */
+		delay_ms(5);
+		uint32_t us = (uint32_t)((ticks() - t0) * 10 / 192);
+		/* wait for RESET_STATE_INIT (0xA0..0xAF) */
+		uint8_t st[6] = {0};
+		for (int i = 0; i < 50; i++) {
+			nvt_set_page(EVENT_BUF | 0x60);
+			st[0] = 0x60;
+			nvt_read(st, 6);
+			if (st[1] >= 0xA0 && st[1] <= 0xAF)
+				break;
+			delay_ms(10);
+		}
+		con_hex2("FW BOOT", "state=", st[1], "us=", us);
+		if (st[1] >= 0xA0 && st[1] <= 0xAF)
+			return 0;
+		nvt_set_page(CRC_FLAG);
+		uint8_t f[2] = {CRC_FLAG & 0x7f};
+		nvt_read(f, 2);
+		con_hex2("FW CRC", "flag=", f[1], "ilm=", nvt_rd32(R_ILM_CRC));
+		con_hex2("FW CRC", "g_ilm=", nvt_rd32(G_ILM_CRC), "dlm=", nvt_rd32(R_DLM_CRC));
+	}
+	return -1;
+}
+
+static void dot(uint32_t x, uint32_t y, uint32_t color)
+{
+	if (x >= FB_W || y >= FB_H)
+		return;
+	for (uint32_t dy = 0; dy < 6; dy++)
+		for (uint32_t dx = 0; dx < 6; dx++)
+			if (x + dx < FB_W && y + dy < FB_H)
+				con_fb[(y + dy) * (FB_STRIDE / 4) + x + dx] = color;
+}
+
+/* poll the event buffer for ~2 minutes and draw every finger */
+static void nvt_touch_loop(void)
+{
+	uint8_t fwi[12] = {0x78};
+	nvt_set_page(EVENT_BUF | 0x78);
+	nvt_read(fwi, 12);
+	con_hex2("FW INFO", "ver=", fwi[1], "x/y max=", (fwi[5] << 8 | fwi[6]) << 16 | (fwi[7] << 8 | fwi[8]));
+	con_str("TOUCH", "DRAW ON THE SCREEN NOW (2 min)");
+	uint32_t pk = 0, bad = 0, fingers = 0;
+	static uint8_t tx[80], rx[80];
+	uint64_t end = ticks() + 19200ULL * 1000 * 120;
+	while (ticks() < end) {
+		nvt_set_page(EVENT_BUF);
+		tx[0] = 0;			/* read offset 0 of the event buffer */
+		if (spi_xfer(tx, rx, 67))
+			break;
+		uint8_t *d = rx + 1;		/* d[1..65] = point_data[1..65] */
+		pk++;
+		uint8_t sum = 0;
+		for (int i = 1; i < 65; i++)
+			sum += d[i];
+		sum = ~sum + 1;
+		if (sum != d[65]) {
+			bad++;
+			delay_ms(8);
+			continue;
+		}
+		for (int i = 0; i < 10; i++) {
+			uint8_t *p = d + 1 + 6 * i;
+			uint8_t id = p[0] >> 3, s = p[0] & 7;
+			if (id == 0 || id > 10 || (s != 1 && s != 2))
+				continue;
+			uint32_t x = (p[1] << 4) | (p[3] >> 4);
+			uint32_t y = (p[2] << 4) | (p[3] & 0xf);
+			dot(x, y, id == 1 ? 0xff00ff00 : 0xffff00ff);
+			fingers++;
+		}
+		delay_ms(8);
+	}
+	con_hex2("TOUCH END", "packets=", pk, "badsum=", bad);
+	con_hex("TOUCH dots", fingers);
 }
 
 static void pin_spi(void)
@@ -363,7 +591,7 @@ static int se_spi_setup(void)
 
 void test_touch(uintptr_t dtb)
 {
-	con_str("SHIM", "ios-flame stage 6f: touch diagnostics");
+	con_str("SHIM", "ios-flame stage 6g: touch firmware + points");
 	con_skip();
 	find_panel(dtb);
 	int novatek = has(panel, "c3f_35") || has(panel, "c3f_37") || has(panel, "c3f_43");
@@ -375,12 +603,7 @@ void test_touch(uintptr_t dtb)
 	con_hex2("CBCR ahb", "m=", rd(CBCR_M_AHB), "s=", rd(CBCR_S_AHB));
 	con_hex2("CBCR s1", "cbcr=", rd(CBCR_S1), "rcgcmd=", rd(RCG_S1));
 	con_hex2("RCG s1", "cfg=", rd(RCG_S1 + 4), "dfsr=", rd(RCG_S1 + 0x14));
-	static const uint8_t pins[6] = {10, 11, 12, 13, 34, 98};
-	for (int i = 0; i < 6; i++) {
-		const char *nm = i == 0 ? "GPIO10 miso" : i == 1 ? "GPIO11 mosi" : i == 2 ? "GPIO12 clk" :
-				 i == 3 ? "GPIO13 cs" : i == 4 ? "GPIO34 irq" : "GPIO98 rst";
-		con_hex2(nm, "ctl=", rd(TLMM_CTL(pins[i])), "io=", rd(TLMM_IO(pins[i])));
-	}
+	con_hex2("GPIO98 rst", "ctl=", rd(TLMM_CTL(98)), "io=", rd(TLMM_IO(98)));
 	con_skip();
 
 	uint32_t vote = rd(GCC_VOTE);
@@ -411,15 +634,11 @@ void test_touch(uintptr_t dtb)
 		/* irq gpio34: input, no pull (the touch IC drives it) */
 		wr(TLMM_CTL(34), 0);
 		nvt_probe();
-		nvt_rw_test("RW 4.8MHz");
-		wr(SE + GENI_SER_M_CLK_CFG, (16u << 4) | 1);	/* 1.2 MHz */
-		nvt_rw_test("RW 1.2MHz");
-		wr(SE + SE_SPI_CPHA, 1);			/* mode 1, just to compare */
-		nvt_rw_test("RW mode1");
-		wr(SE + SE_SPI_CPHA, 0);
+		if (nvt_download() == 0)
+			nvt_touch_loop();
+		else
+			con_str("FW", "download FAILED");
 	} else {
 		con_str("TOUCH", "not Novatek: SPI probe skipped this round");
 	}
-	con_hex2("GPIO34 irq", "ctl=", rd(TLMM_CTL(34)), "io=", rd(TLMM_IO(34)));
-	con_hex2("GPIO98 rst", "ctl=", rd(TLMM_CTL(98)), "io=", rd(TLMM_IO(98)));
 }
