@@ -82,6 +82,7 @@ static void udelay(unsigned us) { uint64_t e = ticks() + (uint64_t)us * 192 / 10
 
 static char panel[48];
 static uint32_t fifo_words;
+static uint8_t last_rx[16];
 
 static int has(const char *s, const char *sub)
 {
@@ -177,6 +178,8 @@ static int nvt_read(uint8_t *buf, uint32_t n)
 	tx[0] = buf[0] & 0x7f;
 	if (spi_xfer(tx, rx, n + 1))
 		return -1;
+	for (uint32_t i = 0; i < 16; i++)
+		last_rx[i] = rx[i];
 	for (uint32_t i = 1; i < n; i++)
 		buf[i] = rx[i + 1];
 	return 0;
@@ -212,6 +215,8 @@ static void nvt_probe(void)
 		uint8_t id[7] = {trim & 0x7f, 0, 0, 0, 0, 0, 0};
 		if (nvt_read(id, 7))
 			return;
+		con_hex2("NVT raw", "rx0-3=", last_rx[0] | last_rx[1] << 8 | last_rx[2] << 16 | (uint32_t)last_rx[3] << 24,
+			 "rx4-7=", last_rx[4] | last_rx[5] << 8 | last_rx[6] << 16 | (uint32_t)last_rx[7] << 24);
 		con_hex2(r == 0 ? "NVT ID 1FB104" : r == 1 ? "NVT ID 3F004" : "NVT ID 1F64E",
 			 "b1-4=", id[1] | id[2] << 8 | id[3] << 16 | (uint32_t)id[4] << 24,
 			 "b5-6=", id[5] | id[6] << 8);
@@ -292,13 +297,14 @@ static int se_spi_setup(void)
 	if (dfs) {
 		for (idx = 0; idx < 8; idx++) {
 			uint32_t perf = rd(RCG_S1 + 0x1c + 4 * idx);
-			if (((perf >> 8) & 7) == 0 && (perf & 0x1f) == 0)
+			if (((perf >> 8) & 7) == 0 && (perf & 0x1f) <= 1)
 				break;		/* XO, no divider */
 		}
 		if (idx == 8)
 			idx = 0;
 	}
 	con_hex2("SE1 CLK", "dfs=", dfs, "level=", idx);
+	con_hex2("RCG perf", "l4=", rd(RCG_S1 + 0x2c), "l7=", rd(RCG_S1 + 0x38));
 	uint32_t qv = rd(QUP0 + 4);
 	uint32_t div = ((qv >> 28) == 1 && ((qv >> 16) & 0xfff) == 0) ? 2 : 4;	/* oversampling 2 on QUP 1.0 */
 	wr(SE + SE_GENI_CLK_SEL, idx & 7);
@@ -309,7 +315,7 @@ static int se_spi_setup(void)
 
 void test_touch(uintptr_t dtb)
 {
-	con_str("SHIM", "ios-flame stage 6b: touch diagnostics");
+	con_str("SHIM", "ios-flame stage 6c: touch diagnostics");
 	con_skip();
 	find_panel(dtb);
 	int novatek = has(panel, "c3f_35") || has(panel, "c3f_37") || has(panel, "c3f_43");
@@ -350,6 +356,15 @@ void test_touch(uintptr_t dtb)
 	pin_spi();
 	udelay(100);
 	if (novatek) {
+		/* driver probe: eng reset, then TP_RESX (gpio98) high, 10 ms after POR */
+		nvt_write_addr(0x7FFF80, 0x5A);
+		delay_ms(1);
+		wr(TLMM_IO(98), 2);			/* output value high */
+		wr(TLMM_CTL(98), (1u << 9) | (3u << 6));	/* gpio, OE, 8 mA, no pull */
+		delay_ms(10);
+		con_hex2("GPIO98 rst", "ctl=", rd(TLMM_CTL(98)), "io=", rd(TLMM_IO(98)));
+		/* irq gpio34: input, no pull (the touch IC drives it) */
+		wr(TLMM_CTL(34), 0);
 		nvt_probe();
 	} else {
 		con_str("TOUCH", "not Novatek: SPI probe skipped this round");
