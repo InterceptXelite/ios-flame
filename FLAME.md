@@ -21,7 +21,7 @@ Personal use only. Apple's IPSW files, partition backups and device dumps never 
 | 3 | XNU reaches the Apple logo / console on flame | todo — first real XNU boot |
 | 4 | iOS root image into `userdata` (**erases Android data**) | todo — you download the IPSW |
 | 5 | SpringBoard / lock screen | todo |
-| 6 | flame drivers: FocalTech FT8726 touch (I2C QUP0 SE1 `0x984000`, addr 0x38, irq gpio13, reset gpio12), volume up (TLMM gpio53), power/vol- (PMK8350 PON over SPMI arb v7 at `0xc400000`) | todo |
+| 6 | flame drivers: NT36528A touch (SPI QUP0 SE1 `0x984000`, irq gpio34, reset gpio98, fw loaded by the shim), volume up (TLMM gpio53), power/vol- (PMK8350 PON over SPMI arb v7) | **done** (keys + touch verified; apps black, open) |
 
 Not possible on any iOS-on-Android port today: Wi-Fi, Bluetooth, calls/data, audio, camera, GPU.
 
