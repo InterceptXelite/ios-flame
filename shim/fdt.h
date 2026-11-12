@@ -12,3 +12,6 @@ void fdt_memory_dump(uintptr_t fdt, void (*cb)(const char *name, uint64_t b, uin
 
 /* Largest /memory bank with base >= min_base. */
 int fdt_memory_largest(uintptr_t fdt, uint64_t min_base, uint64_t *base, uint64_t *size);
+
+/* Pointer/length of a /chosen property (bytes, read with byte loads). */
+int fdt_chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val, uint32_t *len);

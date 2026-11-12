@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "touch.h"
 #include "board.h"
 #if !BOARD_GEN_OK
 #error "board_gen.h is a placeholder: run tools/flame-extract.py on flame's live DTB first"
@@ -93,7 +94,7 @@ static uint64_t now(void)
 	return rsr("cntpct_el0");
 }
 
-static void delay_ms(unsigned ms)
+void delay_ms(unsigned ms)
 {
 	uint64_t end = now() + rsr("cntfrq_el0") / 1000 * ms;
 	while (now() < end)
@@ -142,7 +143,7 @@ static void irq_handler(void)
  * instruction and report it instead of panicking. */
 static volatile int probing, probe_faults;
 
-static int probe_wr32(uintptr_t a, uint32_t v)
+int probe_wr32(uintptr_t a, uint32_t v)
 {
 	int before = probe_faults;
 	probing = 1;
@@ -424,6 +425,15 @@ void shim_main(uint64_t dtb)
 		reset(90);
 	}
 
+#ifdef FLAME_DIAG_TOUCH
+	stage = "touch";
+	con_clear(BLUE);
+	test_touch(dtb);
+	con_skip();
+	con_str("TOUCH", "diagnostics done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
+#endif
 #ifndef FLAME_DIAG_SKIP_UFS
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
