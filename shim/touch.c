@@ -17,6 +17,10 @@
 #include "fdt.h"
 #include "touch.h"
 
+#ifndef TOUCH_FW_PANEL
+#define TOUCH_FW_PANEL "c3f_43_02_0a"	/* xinli panel <-> novatek_ts_fw_xinli.bin */
+#endif
+
 extern int probe_wr32(uintptr_t a, uint32_t v);
 extern void delay_ms(unsigned ms);
 
@@ -641,4 +645,42 @@ void test_touch(uintptr_t dtb)
 	} else {
 		con_str("TOUCH", "not Novatek: SPI probe skipped this round");
 	}
+}
+
+/*
+ * Normal boot (FLAME_TOUCH_BOOT): bring the touch IC up and load its firmware
+ * before xnu starts. xnu's flame touch driver (patch 0094) then only polls the
+ * event buffer over the already configured SE1. Firmware is panel specific:
+ * only the panel matching the linked blob is touched.
+ */
+void touch_boot(uintptr_t dtb)
+{
+	find_panel(dtb);
+	if (touch_fw_end - touch_fw_start < 0x10000) {
+		con_str("TOUCH", "no firmware linked - skipped");
+		return;
+	}
+	if (!has(panel, TOUCH_FW_PANEL)) {
+		con_str("TOUCH", "panel does not match the linked firmware - skipped");
+		return;
+	}
+	if (!probe_wr32(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP0)) {
+		con_str("TOUCH", "clock vote aborted - skipped");
+		return;
+	}
+	uint64_t end = ticks() + 19200 * 20;
+	while ((rd(CBCR_S1) >> 31) && ticks() < end)
+		;
+	if ((rd(CBCR_S1) >> 31) || se_spi_setup())
+		return;
+	pin_spi();
+	udelay(100);
+	nvt_write_addr(0x7FFF80, 0x5A);
+	delay_ms(1);
+	wr(TLMM_IO(98), 2);
+	wr(TLMM_CTL(98), (1u << 9) | (3u << 6));
+	delay_ms(10);
+	wr(TLMM_CTL(34), 0);
+	nvt_probe();
+	con_str("TOUCH", nvt_download() == 0 ? "firmware running, handing over to xnu" : "firmware download FAILED");
 }

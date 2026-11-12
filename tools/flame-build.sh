@@ -16,10 +16,10 @@ CPUS="${2:-1}"   # start with 1 core; 6 once the kernel is stable on flame
 # dtb/vendor_boot.img optional (alignment padding only)
 
 # sweet-only hardware drivers stay OFF on flame until the flame drivers exist:
-#   sweettouch=0  (Goodix on sweet's I2C bus + RPMh vote at sweet addresses)
+#   sweettouch    now the flame NT36528A poller (patch 0094), on by default
 #   sweetkeys     now the flame driver (patch 0093), on by default
 #   sweetusb=0
-FLAME_OFF="sweettouch=0 sweetkeys=${KEYS:-1} sweetusb=0"   # KEYS=0 to disable the flame key driver (patch 0093)
+FLAME_OFF="sweettouch=${TOUCHDRV:-1} sweetkeys=${KEYS:-1} sweetusb=0"   # KEYS=0 to disable the flame key driver (patch 0093)
 # MODE=safe (default): READ-ONLY. userdata still holds Android: no ufsrw, no
 #   persistent log (sweetlog writes the LAST 4 MiB of userdata). Use until stage 4.
 # MODE=ios: after the iOS root is flashed to userdata (stage 4): read-write + log.
@@ -37,6 +37,16 @@ echo "mode: $MODE  ($RW)"
 mkdir -p shim/out
 python3 tools/mkadt.py shim/out/flame.adt --highmem
 python3 tools/mkpayload.py "$K" shim/out/flame.adt shim/out/payload.bin --cmdline "$B"
+# Touch (stage 6): the shim loads the panel's touch firmware before xnu starts.
+# The blob is proprietary (stock flame odm/firmware) and lives only in research/.
+FW="${TOUCH_FW:-research/touchfw/novatek_ts_fw_xinli.bin}"
+if [ "${TOUCH:-1}" = 1 ] && [ -f "$FW" ]; then
+	export TOUCH_FW="$(realpath "$FW")" SHIM_DEFS="${SHIM_DEFS:-} -DFLAME_TOUCH_BOOT"
+	echo "touch: shim loads $(basename "$FW")"
+else
+	unset TOUCH_FW
+	echo "touch: no firmware linked (TOUCH=0 or $FW missing)"
+fi
 (cd shim && ./build.sh ../shim/out/payload.bin)
 cp shim/out/shim-boot.img flame-ios-boot.img
 echo

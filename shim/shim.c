@@ -417,6 +417,11 @@ void shim_main(uint64_t dtb)
 	con_str("SHIM", "ios-flame stage 1: xnu loader");
 	con_str("WDT", wdt_ok ? "stopped" : "locked from EL1 (not armed?) - skipped");
 	con_skip();
+#ifdef FLAME_TOUCH_BOOT
+	stage = "touch";
+	touch_boot(dtb);
+	stage = "loader";
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
