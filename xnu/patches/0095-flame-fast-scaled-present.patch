@@ -1,0 +1,64 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -480,6 +480,33 @@
+ 	if (py1 + fBarY > (int32_t)fHeight) {
+ 		py1 = (int32_t)fHeight - fBarY;
+ 	}
++	/*
++	 * Column map (panel x -> logical x, centre sample) computed once: the
++	 * per-pixel divisions and range checks were most of the present cost.
++	 * The covered columns are a contiguous run, so the inner loop is a plain
++	 * gather, written as 64-bit pairs into the write-combined panel memory.
++	 */
++	static int16_t lx_of[2048];
++	static bool lx_ready;
++	if (!lx_ready) {
++		for (int32_t i = 0; i < 2048; i++) {
++			lx_of[i] = (int16_t)((i * FLAME_SCALE_DEN + FLAME_SCALE_DEN / 2) / FLAME_SCALE_NUM);
++		}
++		lx_ready = true;
++	}
++	if (px1 > 2048) {
++		px1 = 2048;
++	}
++	int32_t qx0 = px0, qx1 = px1;
++	while (qx0 < qx1 && lx_of[qx0] < dx) {
++		qx0++;
++	}
++	while (qx1 > qx0 && lx_of[qx1 - 1] >= dx + w) {
++		qx1--;
++	}
++	if (qx0 >= qx1) {
++		return;
++	}
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t ly = (py * FLAME_SCALE_DEN + FLAME_SCALE_DEN / 2) / FLAME_SCALE_NUM;	/* centre sample */
+ 		if (ly < dy || ly >= dy + h) {
+@@ -489,14 +516,20 @@
+ 		if (srow + (uint64_t)(sx + w) * 4 > len) {
+ 			break;
+ 		}
+-		const uint32_t *in = (const uint32_t *)(src + srow);
++		/* in[lx_of[px]] is logical column lx_of[px] of this layer */
++		const uint32_t *in = (const uint32_t *)(src + srow) + sx - dx;
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)(py + fBarY) * fRowBytes);
+-		for (int32_t px = px0; px < px1; px++) {
+-			int32_t lx = (px * FLAME_SCALE_DEN + FLAME_SCALE_DEN / 2) / FLAME_SCALE_NUM;
+-			if (lx < dx || lx >= dx + w) {
+-				continue;
+-			}
+-			out[px] = in[sx + lx - dx];
++		int32_t px = qx0;
++		if (px & 1) {
++			out[px] = in[lx_of[px]];
++			px++;
++		}
++		for (; px + 1 < qx1; px += 2) {
++			*(uint64_t *)(void *)(out + px) =
++			    (uint64_t)in[lx_of[px]] | ((uint64_t)in[lx_of[px + 1]] << 32);
++		}
++		if (px < qx1) {
++			out[px] = in[lx_of[px]];
+ 		}
+ 	}
+ }
