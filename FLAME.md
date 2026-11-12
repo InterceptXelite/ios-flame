@@ -143,3 +143,23 @@ Rules for ALL flame code (shim and XNU drivers): plain MMIO accessors only (GIC 
 - Next: `NOCON=1` images (`sweetfb_noconsole=1`), cpus=6 (untested on flame) and cpus=1.
 - Known risk: the HFS volume is not journaled; unclean reboots during writes can corrupt it
   (sweet saw this). Re-flash the image if hfs errors appear; journaling is a TODO in hfsbuild.
+
+## Status 2026-11-12: lock screen, keys, touch, GPU commands
+
+- iOS 16.7.16 boots to the lock screen on 6 and 8 cores (`flame-stage6-touch-8core-60hz`); unlock works.
+  Open issue: apps open to a black/white screen (to be compared on 6 cores / 30 Hz, then the kernel log).
+- Keys (0093): power + vol-down from PMK8350 PON RT_STS 0x1310 bits 7/6 over SPMI arb v7 observer
+  (0x20 per APID), vol-up TLMM gpio53. All three verified.
+- Touch (0094 + shim `FLAME_TOUCH_BOOT`): panel `c3f_43_02_0a` (xinli) = Novatek NT36528A on QUP0 SE1
+  **SPI** (0x984000, gpio10..13, irq gpio34, reset gpio98). The FT8726/I2C node is a QRD leftover.
+  GENI full duplex is opcode **3** (7 = TX then RX), CS via explicit 8/9 commands, DFS level 0 = XO.
+  The shim downloads `novatek_ts_fw_xinli.bin` (hw-CRC flow, 0.17 s) and xnu polls the event buffer.
+- GPU (shim `FLAME_DIAG_GPU`, stage 8a-8j): Adreno 613 (gmu_wrapper) powers up from EL1: GCC gpu
+  branches, GPU_CC CX/GX GDSC (BCR pulse, AON reset, clamp release, POLL_CFG), gfx3d RCG on XO.
+  kgsl-smmu: needs `gpu_cc_hlos1_vote_gpu_smmu` (GPU_CC 0x7000) + cx_gmu before any CB access (else the
+  bus hangs and the watchdog resets). Gunyah refuses S2CR bypass; SMR0 = 0x84000000 (SID 0 mask 0x400)
+  + CB0 S1 identity tables (2 MiB blocks) is accepted. **CB_TCR2.SEP must be 7 (upstream)**: with 0,
+  VA bit 31 picks TTBR1 and everything above 2 GiB faults at level 0. With a630_sqe.fw (stock vendor)
+  ME_INIT + CP_MEM_WRITE executed: scratch = 0xC0FFEE01, rptr = wptr. SECVID_TRUST_CNTL stays 1
+  (no zap shader) and does not block this.
+- Proprietary blobs live only in research/ (touchfw/, gpufw/), linked by TOUCH_FW= / GPU_FW=.
