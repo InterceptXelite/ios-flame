@@ -321,3 +321,266 @@ void test_ufs(void)
 		return;
 	list_partitions(elba, nent);
 }
+
+/* ======================================================================
+ * Log viewer (FLAME_LOGVIEW): shows the tail of the sweetlog ring (patch
+ * 0047, last 1025 blocks of userdata) on the panel. READ-ONLY like the rest
+ * of this file. Volume up = older page, volume down = newer page.
+ * ====================================================================== */
+#include "font.h"
+
+extern void delay_ms(unsigned ms);
+
+#define LV_TAIL_BLOCKS	64			/* last 256 KiB of the console stream */
+#define LV_COLS		88
+#define LV_ROWS		100
+#define LV_MAXLINES	12000
+
+static uint8_t lv_buf[(LV_TAIL_BLOCKS + 1) * BLOCK] __attribute__((aligned(4096)));
+static uint32_t lv_line_off[LV_MAXLINES];
+static uint16_t lv_line_len[LV_MAXLINES];
+
+static int ufs_open_quiet(void)
+{
+	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY) || ufs_rd(REG_UTRLDBR))
+		return -1;
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1))
+		return -2;
+	uint32_t ocs, st, rc = 1;
+	static const uint8_t tur[6] = { 0x00 };
+	static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+	for (int i = 0; i < 3 && rc; i++)
+		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+	if (rc) {
+		for (int i = 0; i < 2; i++)
+			if (!scsi(0xd0, tur, sizeof(tur), 0, 0, &ocs, &st))
+				break;
+		for (int i = 0; i < 3; i++)
+			if (!scsi(0xd0, ssu, sizeof(ssu), 0, 0, &ocs, &st))
+				break;
+		for (int i = 0; i < 3 && rc; i++)
+			rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+	}
+	return rc ? -3 : 0;
+}
+
+static int find_userdata(uint64_t *first, uint64_t *last)
+{
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	if (read_blocks(0, 2, data))
+		return -1;
+	const uint8_t *gpt = data + BLOCK;
+	uint32_t nent = gpt[80] | gpt[81] << 8, elba = gpt[72] | gpt[73] << 8;
+	if (nent > 128 || read_blocks(elba, (nent * 128 + BLOCK - 1) / BLOCK, ents))
+		return -2;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		static const char want[] = "userdata";
+		int k = 0;
+		while (k < 8 && e[56 + 2 * k] == (uint8_t)want[k])
+			k++;
+		if (k == 8 && e[56 + 16] == 0) {
+			*first = le64(e + 32);
+			*last = le64(e + 40);
+			return 0;
+		}
+	}
+	return -3;
+}
+
+static void lv_char(int col, int r, char ch, uint32_t fg, uint32_t bg)
+{
+	if (ch < 0x20 || ch > 0x7e)
+		ch = ' ';
+	const unsigned char *g = font8x16[ch - 0x20];
+	int x0 = 4 + col * 8, y0 = 8 + r * 16;
+	if (x0 + 8 > FB_W || y0 + 16 > FB_H)
+		return;
+	for (int gy = 0; gy < 16; gy++) {
+		volatile uint32_t *p = con_fb + (y0 + gy) * (FB_STRIDE / 4) + x0;
+		for (int gx = 0; gx < 8; gx++)
+			p[gx] = (g[gy] & (0x80 >> gx)) ? fg : bg;
+	}
+}
+
+static void lv_text(int col, int r, const char *s, uint32_t fg, uint32_t bg)
+{
+	while (*s && col < LV_COLS)
+		lv_char(col++, r, *s++, fg, bg);
+	while (col < LV_COLS)
+		lv_char(col++, r, ' ', fg, bg);
+}
+
+static void lv_num(char *p, uint32_t v)
+{
+	char t[12];
+	int n = 0;
+	do {
+		t[n++] = '0' + v % 10;
+		v /= 10;
+	} while (v);
+	while (n)
+		*p++ = t[--n];
+	*p = 0;
+}
+
+/* keys, read-only: vol-up = TLMM gpio53 low; vol-down = PMK8350 PON RT_STS bit 6 */
+#define LV_TLMM53	(0x0f100000UL + 53UL * 0x1000UL + 4)
+#define LV_CORE		0x0c400000UL
+#define LV_OBS		0x0c440000UL
+static uint32_t lv_rd(uintptr_t a) { uint32_t v; __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory"); return v; }
+static void lv_wr(uintptr_t a, uint32_t v) { __asm__ volatile("dsb sy; str %w0, [%1]; dsb sy" : : "r"(v), "r"(a) : "memory"); }
+static int lv_pon_apid = -1;
+
+static void lv_keys_init(void)
+{
+	uint32_t ver = lv_rd(LV_CORE);
+	if (ver < 0x70000000u || ver >= 0x80000000u)
+		return;
+	for (int i = 0; i < 1024; i++) {
+		uint32_t map = lv_rd(LV_CORE + 0x2000 + 4 * i);
+		if (map && ((map >> 8) & 0xfff) == 0x013) {
+			lv_pon_apid = i;
+			return;
+		}
+	}
+}
+
+static int lv_voldown(void)
+{
+	if (lv_pon_apid < 0)
+		return 0;
+	uintptr_t ch = LV_OBS + 0x20UL * lv_pon_apid;
+	lv_wr(ch, (1u << 27) | (0x10u << 4));		/* EXT_READL 0x1310 low byte */
+	for (int i = 0; i < 1000; i++) {
+		uint32_t st = lv_rd(ch + 8);
+		if (st & 1)
+			return (st & 0xe) ? 0 : !!(lv_rd(ch + 0x18) & 0x40);
+	}
+	return 0;
+}
+
+static int lv_volup(void)
+{
+	return !(lv_rd(LV_TLMM53) & 1);
+}
+
+static void lv_show(uint32_t nlines, uint32_t top, const char *hdr)
+{
+	char h[96];
+	int n = 0;
+	for (const char *s = hdr; *s && n < 60; s++)
+		h[n++] = *s;
+	h[n++] = ' ';
+	lv_num(h + n, top / (LV_ROWS - 1) + 1);
+	while (h[n])
+		n++;
+	h[n++] = '/';
+	lv_num(h + n, (nlines + LV_ROWS - 2) / (LV_ROWS - 1));
+	lv_text(0, 0, h, 0xff000000u, 0xffffff00u);
+	for (uint32_t r = 0; r < LV_ROWS - 1; r++) {
+		uint32_t li = top + r;
+		char line[LV_COLS + 1];
+		uint32_t len = 0;
+		if (li < nlines) {
+			len = lv_line_len[li];
+			for (uint32_t k = 0; k < len; k++)
+				line[k] = lv_buf[lv_line_off[li] + k];
+		}
+		line[len] = 0;
+		lv_text(0, r + 1, line, 0xffe0e0e0u, 0xff101018u);
+	}
+}
+
+void log_view(void)
+{
+	con_clear(0xff101018u);
+	con_str("LOGVIEW", "reading the iOS kernel log (read-only)");
+	int rc = ufs_open_quiet();
+	if (rc) {
+		con_hex("UFS open failed", (uint32_t)-rc);
+		return;
+	}
+	uint64_t first = 0, last = 0;
+	if ((rc = find_userdata(&first, &last))) {
+		con_hex("no userdata in GPT", (uint32_t)-rc);
+		return;
+	}
+	uint32_t hdr_lba = (uint32_t)(last + 1 - 1025);
+	if (read_blocks(hdr_lba, 1, data)) {
+		con_str("LOGVIEW", "header read error");
+		return;
+	}
+	static const char magic[] = "SWEETLOG";
+	for (int i = 0; i < 8; i++)
+		if (data[i] != (uint8_t)magic[i]) {
+			con_str("LOGVIEW", "no SWEETLOG header: no log saved yet (boot iOS with MODE=ios)");
+			return;
+		}
+	uint32_t size = data[12] | data[13] << 8 | data[14] << 16 | (uint32_t)data[15] << 24;
+	uint64_t total = le64(data + 16);
+	if (size == 0 || size > 1024 * BLOCK || (size % BLOCK)) {
+		con_hex("bad ring size", size);
+		return;
+	}
+	/* stream bytes [from, total) with from = total - tail (or 0) */
+	uint64_t tail = (uint64_t)LV_TAIL_BLOCKS * BLOCK;
+	if (tail > size)
+		tail = size;
+	if (tail > total)
+		tail = total;
+	uint64_t from = total - tail;
+	uint32_t got = 0;
+	while (got < tail) {
+		uint64_t pos = (from + got) % size;			/* ring offset */
+		uint32_t blk = (uint32_t)(pos / BLOCK), off = (uint32_t)(pos % BLOCK);
+		if (read_blocks(hdr_lba + 1 + blk, 1, data)) {
+			con_str("LOGVIEW", "ring read error");
+			return;
+		}
+		uint32_t take = BLOCK - off;
+		if (take > tail - got)
+			take = (uint32_t)(tail - got);
+		for (uint32_t k = 0; k < take; k++)
+			lv_buf[got + k] = data[off + k];
+		got += take;
+	}
+	/* split into display lines (wrap at LV_COLS) */
+	uint32_t nlines = 0, start = 0;
+	for (uint32_t i = 0; i <= got && nlines < LV_MAXLINES; i++) {
+		if (i == got || lv_buf[i] == '\n' || i - start == LV_COLS) {
+			lv_line_off[nlines] = start;
+			lv_line_len[nlines] = (uint16_t)(i - start);
+			nlines++;
+			start = (i < got && lv_buf[i] == '\n') ? i + 1 : i;
+		}
+	}
+	lv_keys_init();
+	uint32_t per = LV_ROWS - 1;
+	uint32_t top = nlines > per ? nlines - per : 0;
+	char hdr[64];
+	int n = 0;
+	for (const char *s = "iOS KERNEL LOG  VOL+ older  VOL- newer  page"; *s; s++)
+		hdr[n++] = *s;
+	hdr[n] = 0;
+	lv_show(nlines, top, hdr);
+	for (;;) {				/* stays until the phone is switched off */
+		if (lv_volup() && top > 0) {
+			top = top > per ? top - per : 0;
+			lv_show(nlines, top, hdr);
+			delay_ms(350);
+		} else if (lv_voldown() && top + per < nlines) {
+			top += per;
+			lv_show(nlines, top, hdr);
+			delay_ms(350);
+		}
+		delay_ms(20);
+	}
+}

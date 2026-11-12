@@ -445,6 +445,12 @@ void shim_main(uint64_t dtb)
 		reset(90);
 	}
 
+#ifdef FLAME_LOGVIEW
+	stage = "logview";
+	log_view();
+	delay_ms(180000);
+	reset(20);
+#endif
 #ifdef FLAME_DIAG_GPU
 	stage = "gpu";
 	con_clear(BLUE);
