@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "ufs.h"
 #include "touch.h"
+#include "gpu.h"
 #include "board.h"
 #if !BOARD_GEN_OK
 #error "board_gen.h is a placeholder: run tools/flame-extract.py on flame's live DTB first"
@@ -151,6 +152,20 @@ int probe_wr32(uintptr_t a, uint32_t v)
 	wr32(a, v);
 	__asm__ volatile("dsb sy; isb" ::: "memory");
 	probing = 0;
+	return probe_faults == before;
+}
+
+
+int probe_rd32(uintptr_t a, uint32_t *v)
+{
+	int before = probe_faults;
+	uint32_t x = 0xdeadbeef;
+	probing = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	x = rd32(a);
+	__asm__ volatile("dsb sy; isb" ::: "memory");
+	probing = 0;
+	*v = x;
 	return probe_faults == before;
 }
 
@@ -430,6 +445,15 @@ void shim_main(uint64_t dtb)
 		reset(90);
 	}
 
+#ifdef FLAME_DIAG_GPU
+	stage = "gpu";
+	con_clear(BLUE);
+	test_gpu();
+	con_skip();
+	con_str("GPU", "diagnostics done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
+#endif
 #ifdef FLAME_DIAG_TOUCH
 	stage = "touch";
 	con_clear(BLUE);
