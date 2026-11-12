@@ -8,3 +8,12 @@ touch_fw_start:
 	.incbin TOUCH_FW_PATH
 #endif
 touch_fw_end:
+
+	.section .rodata.gpufw, "a"
+	.balign 16
+	.global gpu_fw_start, gpu_fw_end
+gpu_fw_start:
+#ifdef GPU_FW_PATH
+	.incbin GPU_FW_PATH
+#endif
+gpu_fw_end:

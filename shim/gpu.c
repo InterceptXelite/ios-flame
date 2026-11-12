@@ -79,16 +79,14 @@ static void state(const char *tag)
 	con_hex2("  gcc gpu", "memnoc=", R(GCC + 0x81010), "dvm=", R(GCC + 0x81018));
 }
 
-void test_gpu(void)
+static int gpu_power(void)
 {
-	con_str("SHIM", "ios-flame stage 8a: Adreno 613 power-up");
-	con_skip();
 	state("BEFORE");
 	con_hex2("  pll0", "mode=", R(GPUCC + 0x0), "pll1=", R(GPUCC + 0x1000));
 	con_hex("  probe faults", bad);
 	if (bad) {
 		con_str("GPU", "GPU_CC not readable from EL1 - stop");
-		return;
+		return -1;
 	}
 	con_skip();
 
@@ -105,7 +103,7 @@ void test_gpu(void)
 	con_hex2("CX GDSC", "on=", cx_on, "reg=", R(GPUCC + 0x9108));
 	if (!cx_on || bad) {
 		con_str("GPU", "CX GDSC did not power up - stop");
-		return;
+		return -1;
 	}
 
 	/* GX GDSC: SW reset (GX, ACD, GX_ACD_IROOT BCRs), AON reset, clamp release, on */
@@ -128,7 +126,7 @@ void test_gpu(void)
 	if (!gx_on || bad) {
 		con_str("GPU", "GX GDSC did not power up - stop");
 		state("NOW");
-		return;
+		return -1;
 	}
 
 	/* gfx3d RCG: XO source, no divider (CFG = 0), then UPDATE */
@@ -138,20 +136,22 @@ void test_gpu(void)
 	int core = branch_on(GPUCC + 0x90a8) & branch_on(GPUCC + 0x90b8);	/* gx_gfx3d, gx_cxo */
 	branch_on(GPUCC + 0x919c);					/* cx_gfx3d */
 	branch_on(GPUCC + 0x91a0);					/* cx_gfx3d_slv */
-	state("POWERED");
 	con_hex2("CORE CLK", "on=", core, "faults=", bad);
 	if (!core || bad) {
 		con_str("GPU", "gfx3d clock not running - GPU registers NOT touched");
-		return;
+		return -1;
 	}
-	con_skip();
+	return 0;
+}
 
+static int gpu_alive(void)
+{
 	/* first contact with the GPU itself */
 	uint32_t st = R(GREG(0x210));
 	con_hex2("RBBM", "status=", st, "faults=", bad);
 	if (bad) {
 		con_str("GPU", "GPU register read faulted - stop");
-		return;
+		return -1;
 	}
 	W(GREG(0x883), 0x12345678);
 	W(GREG(0x884), 0x9abcdef0);
@@ -159,6 +159,156 @@ void test_gpu(void)
 	con_hex2("CP SCRATCH", "0=", s0, "1=", s1);
 	con_hex2("CP", "sqe_cntl=", R(GREG(0x808)), "secvid=", R(GREG(0xf400)));
 	con_hex2("RBBM", "int0=", R(GREG(0x201)), "faults=", bad);
-	con_str("GPU", s0 == 0x12345678 && s1 == 0x9abcdef0 ? "ADRENO 613 ALIVE (registers respond)" :
-		"GPU registers do not hold values");
+	int ok = s0 == 0x12345678 && s1 == 0x9abcdef0;
+	con_str("GPU", ok ? "ADRENO 613 ALIVE (registers respond)" : "GPU registers do not hold values");
+	return ok ? 0 : -1;
+}
+
+/* ---------------- stage 8b: SMMU survey + first command stream ---------------- */
+
+#define SMMU	0x03da0000UL
+extern const uint8_t gpu_fw_start[], gpu_fw_end[];
+
+static uint32_t sqe[16384] __attribute__((aligned(4096)));	/* 64 KiB */
+static uint32_t ring[8192] __attribute__((aligned(32768)));	/* 32 KiB */
+static volatile uint32_t scratch[1024] __attribute__((aligned(4096)));
+
+static int smmu_bypass(void)
+{
+	uint32_t cr0 = R(SMMU + 0x0), idr0 = R(SMMU + 0x20), idr1 = R(SMMU + 0x24);
+	con_hex2("SMMU", "cr0=", cr0, "idr1=", idr1);
+	con_hex2("SMMU", "idr0=", idr0, "faults=", bad);
+	if (bad)
+		return 0;
+	uint32_t psz = (idr1 >> 31) ? 0x10000 : 0x1000;
+	uint32_t npage = 1u << (((idr1 >> 28) & 7) + 1);
+	uintptr_t cb = SMMU + (uintptr_t)npage * psz;
+	uint32_t nsmr = idr0 & 0xff;
+	if (nsmr > 7)
+		nsmr = 7;
+	int matched = 0, matched_bypass = 0;
+	for (uint32_t i = 0; i < nsmr; i++) {
+		uint32_t smr = R(SMMU + 0x800 + 4 * i), s2cr = R(SMMU + 0xc00 + 4 * i);
+		uint32_t cbndx = s2cr & 0xff, type = (s2cr >> 16) & 3;
+		uint32_t sctlr = (type == 0 && cbndx < 8 && cb + (uintptr_t)cbndx * psz < SMMU + 0x10000) ?
+				 R(cb + (uintptr_t)cbndx * psz) : 0xffffffff;
+		con_hex2("SMR/S2CR",
+			 "smr=", smr, "s2cr=", s2cr);
+		if (smr >> 31) {		/* valid entry: id [15:0], mask [31:16] style (v2: mask [30:16]) */
+			uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+			if (((0 ^ id) & ~mask & 0x7fff) == 0) {	/* matches stream 0 */
+				matched = 1;
+				matched_bypass = type == 1 || (type == 0 && sctlr != 0xffffffff && !(sctlr & 1));
+				con_hex2("  sid0 hit", "type=", type, "cb sctlr=", sctlr);
+			}
+		}
+	}
+	int clientpd = cr0 & 1, usfcfg = (cr0 >> 10) & 1;
+	int ok = clientpd || (matched ? matched_bypass : !usfcfg);
+	con_str("SMMU", clientpd ? "client port disabled: bypass" :
+		ok ? "GPU stream 0 bypasses translation" : "GPU stream is TRANSLATED or faults - CP test skipped");
+	return ok;
+}
+
+static uint32_t parity(uint32_t v)
+{
+	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1;
+}
+
+static uint32_t pkt7(uint32_t op, uint32_t cnt)
+{
+	return 0x70000000u | cnt | (parity(cnt) << 15) | ((op & 0x7f) << 16) | (parity(op) << 23);
+}
+
+static void W64(uint32_t reg, uint64_t v)
+{
+	W(GREG(reg), (uint32_t)v);
+	W(GREG(reg + 1), (uint32_t)(v >> 32));
+}
+
+static void cp_test(void)
+{
+	uint32_t fwlen = gpu_fw_end - gpu_fw_start;
+	if (fwlen < 1024 || fwlen - 4 > sizeof(sqe)) {
+		con_hex("SQE fw missing, len", fwlen);
+		return;
+	}
+	const volatile uint8_t *f = gpu_fw_start;
+	for (uint32_t i = 0; i + 4 < fwlen + 4 && 4 + i < fwlen; i += 4)
+		sqe[i / 4] = f[4 + i] | f[5 + i] << 8 | f[6 + i] << 16 | (uint32_t)f[7 + i] << 24;
+	for (unsigned i = 0; i < 1024; i++)
+		scratch[i] = 0;
+	con_hex2("SQE fw", "len=", fwlen, "ver=", sqe[1]);
+
+	/* hw_init (A610 family values) */
+	W(GREG(0x3c45), 0); R(GREG(0x3c45));
+	W(GREG(0x16), 0); R(GREG(0x16));
+	W(GREG(0xf803), 0);
+	W64(0xf800, 0);
+	W(GREG(0xf802), 0);
+	static const uint32_t am[] = {0x842, 0xc01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0xe00, 0xae01, 0xb601, 0xf810};
+	for (unsigned i = 0; i < sizeof(am) / 4; i++)
+		W(GREG(am[i]), 1);
+	for (unsigned i = 0; i < 4; i++)
+		W(GREG(0x3c03 + i), 0x00071620);
+	W(GREG(0x11), 3);
+	W64(0xe05, 0x0001ffffffffffc0ULL);
+	W64(0xe09, 0x0001fffffffff000ULL);
+	W64(0xe07, 0x0001fffffffff000ULL);
+	W64(0xe0b, 0x100000);
+	W64(0xe0d, 0x100000 + 0x21000 - 1);
+	W(GREG(0xe18), 0x804);
+	W(GREG(0xe17), 0x4);
+	W(GREG(0x8c2), 0x00800060);
+	W(GREG(0x8c1), 0x40201b16);
+	W(GREG(0x8c3), 48);
+	W(GREG(0x90e), 47);
+	W(GREG(0x9e00), 0x00080000);
+	W(GREG(0x98d), 1);
+	W(GREG(0x1f), (1u << 30) | 0x3ffff);
+	W(GREG(0xe19), (1u << 7) | 1);
+
+	W64(0x830, (uintptr_t)sqe);			/* CP_SQE_INSTR_BASE */
+	W64(0x800, (uintptr_t)ring);			/* CP_RB_BASE */
+	W(GREG(0x802), 12 | (2u << 8) | 0x08000000);	/* BUFSZ 32K, BLKSZ 32, NO_UPDATE */
+	W(GREG(0x807), 0);
+	con_hex2("HW INIT", "faults=", bad, "rbbm=", R(GREG(0x210)));
+	if (bad)
+		return;
+	W(GREG(0x808), 1);				/* CP_SQE_CNTL: start the SQE */
+
+	uint32_t n = 0;
+	ring[n++] = pkt7(72, 8);			/* CP_ME_INIT */
+	ring[n++] = 0x2f; ring[n++] = 3; ring[n++] = 0x20000000;
+	ring[n++] = 0; ring[n++] = 0; ring[n++] = 0; ring[n++] = 0; ring[n++] = 0;
+	ring[n++] = pkt7(61, 3);			/* CP_MEM_WRITE */
+	ring[n++] = (uint32_t)(uintptr_t)scratch;
+	ring[n++] = (uint32_t)((uintptr_t)scratch >> 32);
+	ring[n++] = 0xC0FFEE01;
+	ring[n++] = pkt7(16, 0);			/* CP_NOP pad */
+	__asm__ volatile("dsb sy" ::: "memory");
+	W(GREG(0x807), n);				/* CP_RB_WPTR */
+
+	uint64_t end = ticks() + 19200ULL * 500;
+	while (ticks() < end && scratch[0] != 0xC0FFEE01)
+		;
+	con_hex2("CP", "rptr=", R(GREG(0x806)), "wptr=", n);
+	con_hex2("CP", "hwfault=", R(GREG(0x821)), "int=", R(GREG(0x823)));
+	con_hex2("RBBM", "status=", R(GREG(0x210)), "int0=", R(GREG(0x201)));
+	con_hex2("MEM", "scratch=", scratch[0], "faults=", bad);
+	W(GREG(0xf400), 0);				/* leave secure mode (no zap) */
+	con_hex("SECVID after", R(GREG(0xf400)));
+	con_str("GPU", scratch[0] == 0xC0FFEE01 ? "GPU EXECUTED COMMANDS AND WROTE MEMORY" :
+		"no memory write from the GPU");
+}
+
+void test_gpu(void)
+{
+	con_str("SHIM", "ios-flame stage 8b: Adreno 613 first commands");
+	con_skip();
+	if (gpu_power() || gpu_alive())
+		return;
+	con_skip();
+	if (smmu_bypass())
+		cp_test();
 }

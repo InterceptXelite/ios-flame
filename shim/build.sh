@@ -11,7 +11,7 @@ for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c touch.c gpu.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
 # TOUCH_FW=path/to/novatek_ts_fw_<vendor>.bin embeds the touch firmware (stage 6 test only)
-$CC $CFLAGS ${TOUCH_FW:+-DTOUCH_FW_PATH=\"$(realpath "$TOUCH_FW")\"} -c fw.S -o out/fw.o
+$CC $CFLAGS ${TOUCH_FW:+-DTOUCH_FW_PATH=\"$(realpath "$TOUCH_FW")\"} ${GPU_FW:+-DGPU_FW_PATH=\"$(realpath "$GPU_FW")\"} -c fw.S -o out/fw.o
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
 abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/touch.o out/gpu.o | grep -c ABS64 || true)
