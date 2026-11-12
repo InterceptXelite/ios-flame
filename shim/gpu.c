@@ -205,6 +205,22 @@ static int smmu_bypass(void)
 	}
 	int clientpd = cr0 & 1, usfcfg = (cr0 >> 10) & 1;
 	int ok = clientpd || (matched ? matched_bypass : !usfcfg);
+	if (!ok && !matched) {
+		/*
+		 * Nothing claims the GPU's streams and unmatched streams fault.
+		 * This SMMU serves only the GPU (TBUs gfx_0/gfx_1), so one rule
+		 * matching every stream id (mask 0x7fff) with S2CR type BYPASS
+		 * lets the GPU reach memory by physical address (stage 1 off).
+		 */
+		W(SMMU + 0xc00, 0x00010000);			/* S2CR0: TYPE = bypass */
+		W(SMMU + 0x800, 0x80000000u | (0x7fffu << 16));	/* SMR0: valid, id 0, mask all */
+		__asm__ volatile("dsb sy" ::: "memory");
+		uint32_t smr = R(SMMU + 0x800), s2cr = R(SMMU + 0xc00);
+		con_hex2("SMMU set", "smr0=", smr, "s2cr0=", s2cr);
+		ok = !bad && (smr >> 31) && ((s2cr >> 16) & 3) == 1;
+		con_str("SMMU", ok ? "bypass rule for the GPU installed" : "hypervisor refused the bypass rule");
+		return ok;
+	}
 	con_str("SMMU", clientpd ? "client port disabled: bypass" :
 		ok ? "GPU stream 0 bypasses translation" : "GPU stream is TRANSLATED or faults - CP test skipped");
 	return ok;
@@ -304,7 +320,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8b: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8c: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
