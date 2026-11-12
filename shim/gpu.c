@@ -81,7 +81,7 @@ static void state(const char *tag)
 
 static int gpu_power(void)
 {
-	state("BEFORE");
+	con_hex2("BEFORE", "cxgdsc=", R(GPUCC + 0x9108), "gxgdsc=", R(GPUCC + 0x905c));
 	con_hex("  probe faults", bad);
 	if (bad) {
 		con_str("GPU", "GPU_CC not readable from EL1 - stop");
@@ -185,20 +185,29 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 		smmu_l1[g] = (g << 30) | (1u << 10) | (3u << 8) | (1u << 6) | 1;	/* AF, inner-sh, AP=RW all, block, attr0 */
 	__asm__ volatile("dsb sy" ::: "memory");
 	uintptr_t c = cb;				/* context bank 0 */
-	W(c + 0x0, 0);					/* SCTLR off while programming */
-	W(SMMU + 0x1000 + 0x800, 1);			/* CBA2R0: VA64 */
+	/* every step is announced first: a hang shows which access stalled */
+	con_str("CB step 1", "read CBAR0/CBA2R0 (GR1 page)");
+	uint32_t cbar = R(SMMU + 0x1000), cba2r = R(SMMU + 0x1800);
+	con_hex2("  GR1", "cbar0=", cbar, "cba2r0=", cba2r);
+	con_str("CB step 2", "read CB0 SCTLR/TCR/FSR");
+	con_hex2("  CB0", "sctlr=", R(c + 0x0), "tcr=", R(c + 0x30));
+	con_hex2("  CB0", "fsr=", R(c + 0x58), "faults=", bad);
+	con_str("CB step 3", "write CBA2R0, CBAR0");
+	W(SMMU + 0x1800, 1);				/* CBA2R0: VA64 */
 	W(SMMU + 0x1000, 1u << 16);			/* CBAR0: S1 translate, S2 bypass */
+	con_hex2("  GR1", "cbar0=", R(SMMU + 0x1000), "cba2r0=", R(SMMU + 0x1800));
+	con_str("CB step 4", "write CB0 MAIR/TCR2/TCR/TTBR0");
 	W(c + 0x38, 0x44);				/* MAIR0 attr0 = normal non-cacheable */
 	W(c + 0x3c, 0);
 	W(c + 0x10, 2);					/* TCR2: PASize 40 bit */
 	W(c + 0x30, 25 | (1u << 23));			/* TCR: T0SZ 25, TG0 4K, walks NC, EPD1 */
 	W(c + 0x20, (uint32_t)(uintptr_t)smmu_l1);	/* TTBR0 */
 	W(c + 0x24, (uint32_t)((uintptr_t)smmu_l1 >> 32));
+	con_str("CB step 5", "TLB invalidate (no sync wait)");
 	W(c + 0x618, 0);				/* TLBIALL */
-	W(c + 0x7f0, 0);				/* TLBSYNC */
-	for (int i = 0; i < 1000 && (R(c + 0x7f4) & 1); i++)
-		udelay(1);
+	con_str("CB step 6", "SCTLR enable");
 	W(c + 0x0, (1u << 6) | (1u << 5) | (1u << 2) | (1u << 1) | 1);	/* CFIE CFRE AFE TRE M */
+	con_str("CB step 7", "S2CR0 -> translate CB0");
 	W(SMMU + 0xc00, 0);				/* S2CR0: translate, CB 0 */
 	W(SMMU + 0x800, smr0);
 	__asm__ volatile("dsb sy" ::: "memory");
@@ -357,7 +366,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8d: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8e: Adreno 613 first commands");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
