@@ -82,7 +82,7 @@ static void udelay(unsigned us) { uint64_t e = ticks() + (uint64_t)us * 192 / 10
 
 static char panel[48];
 static uint32_t fifo_words;
-static uint8_t last_rx[16];
+static uint8_t last_rx[24];
 
 static int has(const char *s, const char *sub)
 {
@@ -166,7 +166,7 @@ static int spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
 
 static int nvt_write(uint8_t *buf, uint32_t n)
 {
-	uint8_t rx[16];
+	uint8_t rx[24];
 	buf[0] |= 0x80;
 	return spi_xfer(buf, rx, n);
 }
@@ -174,11 +174,11 @@ static int nvt_write(uint8_t *buf, uint32_t n)
 /* like CTP_SPI_READ: buf[0]=addr; returns buf[1..n-1] */
 static int nvt_read(uint8_t *buf, uint32_t n)
 {
-	uint8_t tx[16] = {0}, rx[16] = {0};
+	uint8_t tx[24] = {0}, rx[24] = {0};
 	tx[0] = buf[0] & 0x7f;
 	if (spi_xfer(tx, rx, n + 1))
 		return -1;
-	for (uint32_t i = 0; i < 16; i++)
+	for (uint32_t i = 0; i < 24; i++)
 		last_rx[i] = rx[i];
 	for (uint32_t i = 1; i < n; i++)
 		buf[i] = rx[i + 1];
@@ -197,6 +197,27 @@ static int nvt_write_addr(uint32_t a, uint8_t v)
 	if (nvt_set_page(a))
 		return -1;
 	return nvt_write(b, 2);
+}
+
+
+static uint32_t le4(const uint8_t *b) { return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
+
+/* protocol self-test: write a pattern to SRAM, read it back; dump the trim area */
+static void nvt_rw_test(const char *tag)
+{
+	nvt_write_addr(0x3F0FE, 0x69);			/* bootloader reset (NT36528A) */
+	delay_ms(5);
+	nvt_set_page(0x22D00);
+	uint8_t w[9] = {0x22D00 & 0x7f, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0};
+	nvt_write(w, 9);
+	uint8_t r[9] = {0x22D00 & 0x7f};
+	nvt_read(r, 9);
+	con_hex2(tag, "ram0-3=", le4(r + 1), "ram4-7=", le4(r + 5));
+	nvt_set_page(0x3F000);
+	uint8_t t[17] = {0x3F000 & 0x7f};
+	nvt_read(t, 17);
+	con_hex2("  3F000", "0-3=", le4(t + 1), "4-7=", le4(t + 5));
+	con_hex2("  3F008", "8-b=", le4(t + 9), "c-f=", le4(t + 13));
 }
 
 static void nvt_probe(void)
@@ -304,7 +325,6 @@ static int se_spi_setup(void)
 			idx = 0;
 	}
 	con_hex2("SE1 CLK", "dfs=", dfs, "level=", idx);
-	con_hex2("RCG perf", "l4=", rd(RCG_S1 + 0x2c), "l7=", rd(RCG_S1 + 0x38));
 	uint32_t qv = rd(QUP0 + 4);
 	uint32_t div = ((qv >> 28) == 1 && ((qv >> 16) & 0xfff) == 0) ? 2 : 4;	/* oversampling 2 on QUP 1.0 */
 	wr(SE + SE_GENI_CLK_SEL, idx & 7);
@@ -315,7 +335,7 @@ static int se_spi_setup(void)
 
 void test_touch(uintptr_t dtb)
 {
-	con_str("SHIM", "ios-flame stage 6c: touch diagnostics");
+	con_str("SHIM", "ios-flame stage 6d: touch diagnostics");
 	con_skip();
 	find_panel(dtb);
 	int novatek = has(panel, "c3f_35") || has(panel, "c3f_37") || has(panel, "c3f_43");
@@ -325,11 +345,8 @@ void test_touch(uintptr_t dtb)
 
 	con_hex("GCC vote", rd(GCC_VOTE));
 	con_hex2("CBCR ahb", "m=", rd(CBCR_M_AHB), "s=", rd(CBCR_S_AHB));
-	con_hex2("CBCR core", "1x=", rd(CBCR_CORE), "2x=", rd(CBCR_CORE2X));
 	con_hex2("CBCR s1", "cbcr=", rd(CBCR_S1), "rcgcmd=", rd(RCG_S1));
 	con_hex2("RCG s1", "cfg=", rd(RCG_S1 + 4), "dfsr=", rd(RCG_S1 + 0x14));
-	con_hex2("RCG perf", "l0=", rd(RCG_S1 + 0x1c), "l1=", rd(RCG_S1 + 0x20));
-	con_hex2("RCG perf", "l2=", rd(RCG_S1 + 0x24), "l3=", rd(RCG_S1 + 0x28));
 	static const uint8_t pins[6] = {10, 11, 12, 13, 34, 98};
 	for (int i = 0; i < 6; i++) {
 		const char *nm = i == 0 ? "GPIO10 miso" : i == 1 ? "GPIO11 mosi" : i == 2 ? "GPIO12 clk" :
@@ -366,6 +383,12 @@ void test_touch(uintptr_t dtb)
 		/* irq gpio34: input, no pull (the touch IC drives it) */
 		wr(TLMM_CTL(34), 0);
 		nvt_probe();
+		nvt_rw_test("RW 4.8MHz");
+		wr(SE + GENI_SER_M_CLK_CFG, (16u << 4) | 1);	/* 1.2 MHz */
+		nvt_rw_test("RW 1.2MHz");
+		wr(SE + SE_SPI_CPHA, 1);			/* mode 1, just to compare */
+		nvt_rw_test("RW mode1");
+		wr(SE + SE_SPI_CPHA, 0);
 	} else {
 		con_str("TOUCH", "not Novatek: SPI probe skipped this round");
 	}
