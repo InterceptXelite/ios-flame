@@ -19,7 +19,7 @@ CPUS="${2:-1}"   # start with 1 core; 6 once the kernel is stable on flame
 #   sweettouch=0  (Goodix on sweet's I2C bus + RPMh vote at sweet addresses)
 #   sweetkeys=0   (SPMI arb v5 at sweet addresses; flame has arb v7)
 #   sweetusb=0
-FLAME_OFF="sweettouch=0 sweetkeys=0 sweetusb=0"
+FLAME_OFF="sweettouch=0 sweetkeys=${KEYS:-1} sweetusb=0"   # KEYS=0 to disable the flame key driver (patch 0093)
 # MODE=safe (default): READ-ONLY. userdata still holds Android: no ufsrw, no
 #   persistent log (sweetlog writes the LAST 4 MiB of userdata). Use until stage 4.
 # MODE=ios: after the iOS root is flashed to userdata (stage 4): read-write + log.
