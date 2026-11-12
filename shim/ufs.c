@@ -519,11 +519,38 @@ void log_view(void)
 		return;
 	}
 	static const char magic[] = "SWEETLOG";
+	int ok = 1;
 	for (int i = 0; i < 8; i++)
-		if (data[i] != (uint8_t)magic[i]) {
-			con_str("LOGVIEW", "no SWEETLOG header: no log saved yet (boot iOS with MODE=ios)");
+		ok &= data[i] == (uint8_t)magic[i];
+	if (!ok) {
+		con_hex2("userdata", "first=", (uint32_t)first, "last=", (uint32_t)last);
+		con_hex2("expected hdr", "lba=", hdr_lba, "bytes0-3=",
+			 data[0] | data[1] << 8 | data[2] << 16 | (uint32_t)data[3] << 24);
+		/* search the last 4096 blocks of userdata and the first blocks after
+		 * the HFS volume (100 GiB) for the header, in case the base differs */
+		con_str("LOGVIEW", "searching the end of userdata for SWEETLOG...");
+		uint32_t found = 0;
+		for (uint32_t b = (uint32_t)last - 4096; b <= (uint32_t)last && !found; b++) {
+			if (read_blocks(b, 1, data))
+				break;
+			int m = 1;
+			for (int i = 0; i < 8; i++)
+				m &= data[i] == (uint8_t)magic[i];
+			if (m)
+				found = b;
+		}
+		con_hex2("search", "found lba=", found, "rel=", found ? found - (uint32_t)first : 0);
+		con_hex2("HFS hdr", "blk1 sig=", 0, "", 0);
+		if (!read_blocks((uint32_t)first, 1, data))
+			con_hex2("HFS hdr", "sig@1024=", data[1024] << 8 | data[1025], "blocks@1064=",
+				 (uint32_t)data[1064] << 24 | data[1065] << 16 | data[1066] << 8 | data[1067]);
+		if (!found) {
+			con_str("LOGVIEW", "no SWEETLOG anywhere near the end: iOS never wrote its log");
 			return;
 		}
+		hdr_lba = found;
+		read_blocks(hdr_lba, 1, data);
+	}
 	uint32_t size = data[12] | data[13] << 8 | data[14] << 16 | (uint32_t)data[15] << 24;
 	uint64_t total = le64(data + 16);
 	if (size == 0 || size > 1024 * BLOCK || (size % BLOCK)) {
