@@ -322,6 +322,88 @@ static void W64(uint32_t reg, uint64_t v)
 	W(GREG(reg + 1), (uint32_t)(v >> 32));
 }
 
+
+#ifdef FLAME_GPU_BLIT
+/*
+ * Stage 8k: one CP_BLIT (2D engine, OP_SCALE) from an iPhone X sized linear RGBA8
+ * picture to the panel. Sequence after Bergamota 0240 / freedreno fd6_blitter,
+ * values for the a610/a612 family (Mesa freedreno_devices.py): 1 CCU, 8 KiB
+ * depth cache per CCU (colour offset 2 x 4 KiB), RB_DBG_ECO_CNTL_blit 0x04100000.
+ */
+#define PIC_PA		0xC0000000UL			/* HLOS DRAM, inside the identity map */
+#define PIC_W		1125u
+#define PIC_H		2436u
+#define PIC_PITCH	4544u				/* 1125 * 4 rounded up to 64 */
+#define OUT_W		720u
+#define OUT_H		1559u				/* 2436 * 16 / 25 */
+#define OUT_PA		(FB_BASE + 40UL * FB_STRIDE)	/* 40 px bars, like SweetFramebuffer */
+
+static uint32_t pkt4(uint32_t reg, uint32_t cnt)
+{
+	return 0x40000000u | cnt | (parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (parity(reg) << 27);
+}
+
+static void make_picture(void)
+{
+	volatile uint32_t *p = (volatile uint32_t *)PIC_PA;
+	dcache_flush((void *)PIC_PA, (uint64_t)PIC_PITCH * PIC_H);
+	for (uint32_t y = 0; y < PIC_H; y++) {
+		volatile uint32_t *row = p + (uint64_t)y * (PIC_PITCH / 4);
+		for (uint32_t x = 0; x < PIC_W; x++) {
+			uint32_t r = x * 255 / PIC_W, g = y * 255 / PIC_H, b = 160;
+			uint32_t c = 0xff000000u | r << 16 | g << 8 | b;	/* BGRA in memory */
+			if (x < 24 || x >= PIC_W - 24 || y < 24 || y >= PIC_H - 24 ||
+			    (x % 125) < 6 || (y % 125) < 6)
+				c = 0xffffffffu;			/* white frame + grid */
+			int32_t d = (int32_t)(x * PIC_H / PIC_W) - (int32_t)y;
+			if (d > -14 && d < 14)
+				c = 0xffff2020u;			/* red diagonal */
+			row[x] = c;
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	dcache_flush((void *)PIC_PA, (uint64_t)PIC_PITCH * PIC_H);
+}
+
+static uint32_t blit_cmds(uint32_t *ib, uint32_t n)
+{
+	uint64_t src = PIC_PA, dst = OUT_PA;
+	uint64_t done = (uintptr_t)&scratch[1], junk = (uintptr_t)&scratch[16];
+	ib[n++] = pkt7(38, 0);					/* CP_WAIT_FOR_IDLE */
+	ib[n++] = pkt4(0x8e01, 1); ib[n++] = 0x00000001;	/* RB_UNKNOWN_8E01 (a610 magic) */
+	ib[n++] = pkt4(0x8e07, 1); ib[n++] = 2u << 23;		/* RB_CCU_CNTL: sysmem, colour after 8 KiB depth */
+	ib[n++] = pkt4(0x8c00, 1); ib[n++] = 0x10f03000u;	/* RB_2D_BLIT_CNTL: RGBA8 */
+	ib[n++] = pkt4(0x8400, 1); ib[n++] = 0x10f03000u;	/* GRAS_2D_BLIT_CNTL */
+	ib[n++] = pkt4(0xacc0, 1); ib[n++] = 0xf180u;		/* SP_2D_DST_FORMAT */
+	ib[n++] = pkt4(0x8c01, 1); ib[n++] = 0;
+	ib[n++] = pkt4(0xb4c0, 5);				/* SP_PS_2D_SRC_INFO/SIZE/lo/hi/PITCH */
+	ib[n++] = 0x500030u;
+	ib[n++] = PIC_W | (PIC_H << 15);
+	ib[n++] = (uint32_t)src; ib[n++] = (uint32_t)(src >> 32);
+	ib[n++] = (PIC_PITCH >> 6) << 9;
+	ib[n++] = pkt4(0x8c17, 4);				/* RB_2D_DST_INFO/lo/hi/PITCH */
+	ib[n++] = 0x30u;
+	ib[n++] = (uint32_t)dst; ib[n++] = (uint32_t)(dst >> 32);
+	ib[n++] = FB_STRIDE >> 6;
+	ib[n++] = pkt4(0x8401, 4);				/* GRAS_2D_SRC_TL_X/BR_X/TL_Y/BR_Y, 24.8 */
+	ib[n++] = 0; ib[n++] = (PIC_W - 1) << 8; ib[n++] = 0; ib[n++] = (PIC_H - 1) << 8;
+	ib[n++] = pkt4(0x8405, 2);				/* GRAS_2D_DST_TL/BR */
+	ib[n++] = 0; ib[n++] = (OUT_W - 1) | ((OUT_H - 1) << 16);
+	ib[n++] = pkt7(70, 1); ib[n++] = 0x3f;			/* CP_EVENT_WRITE LABEL */
+	ib[n++] = pkt7(38, 0);
+	ib[n++] = pkt4(0x8e04, 1); ib[n++] = 0x04100000u;	/* RB_DBG_ECO_CNTL_blit (a610) */
+	ib[n++] = pkt7(44, 1); ib[n++] = 3;			/* CP_BLIT OP_SCALE */
+	ib[n++] = pkt7(38, 0);
+	ib[n++] = pkt4(0x8e04, 1); ib[n++] = 0;
+	ib[n++] = pkt7(70, 4); ib[n++] = 0x1d;			/* PC_CCU_FLUSH_COLOR_TS */
+	ib[n++] = (uint32_t)junk; ib[n++] = (uint32_t)(junk >> 32); ib[n++] = 0;
+	ib[n++] = pkt7(38, 0);
+	ib[n++] = pkt7(61, 3);					/* CP_MEM_WRITE: blit done marker */
+	ib[n++] = (uint32_t)done; ib[n++] = (uint32_t)(done >> 32); ib[n++] = 0xB1170D0E;
+	return n;
+}
+#endif
+
 static void cp_test(void)
 {
 	uint32_t fwlen = gpu_fw_end - gpu_fw_start;
@@ -374,6 +456,10 @@ static void cp_test(void)
 	con_hex2("HW INIT", "faults=", bad, "rbbm=", R(GREG(0x210)));
 	if (bad)
 		return;
+#ifdef FLAME_GPU_BLIT
+	con_str("BLIT", "drawing the 1125x2436 test picture in DRAM...");
+	make_picture();
+#endif
 	W(GREG(0x808), 1);				/* CP_SQE_CNTL: start the SQE */
 
 	uint32_t n = 0;
@@ -384,6 +470,9 @@ static void cp_test(void)
 	ring[n++] = (uint32_t)(uintptr_t)scratch;
 	ring[n++] = (uint32_t)((uintptr_t)scratch >> 32);
 	ring[n++] = 0xC0FFEE01;
+#ifdef FLAME_GPU_BLIT
+	n = blit_cmds(ring, n);
+#endif
 	ring[n++] = pkt7(16, 0);			/* CP_NOP pad */
 	__asm__ volatile("dsb sy" ::: "memory");
 	dcache_flush(sqe, sizeof(sqe));
@@ -405,11 +494,19 @@ static void cp_test(void)
 	con_hex("SECVID after", R(GREG(0xf400)));
 	con_str("GPU", scratch[0] == 0xC0FFEE01 ? "GPU EXECUTED COMMANDS AND WROTE MEMORY" :
 		"no memory write from the GPU");
+#ifdef FLAME_GPU_BLIT
+	end = ticks() + 19200ULL * 3000;
+	while (ticks() < end && scratch[1] != 0xB1170D0E)
+		dcache_flush(scratch, 64);
+	con_hex2("BLIT", "done=", scratch[1], "rptr=", R(GREG(0x806)));
+	con_hex2("BLIT", "fsr=", R(SMMU + 0x8000 + 0x58), "far=", R(SMMU + 0x8000 + 0x60));
+	con_str("GPU", scratch[1] == 0xB1170D0E ? "GPU SCALED THE TEST PICTURE ONTO THE SCREEN" : "blit did not finish");
+#endif
 }
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8j: Adreno 613 first commands");
+	con_str("SHIM", "ios-flame stage 8k: Adreno 613 scales a picture");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
