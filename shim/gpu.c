@@ -219,16 +219,8 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	dcache_flush(smmu_l2, sizeof(smmu_l2));
 	uintptr_t c = cb;				/* context bank 0 */
 	/* every step is announced first: a hang shows which access stalled */
-	con_str("CB step 1", "read CBAR0/CBA2R0 (GR1 page)");
-	uint32_t cbar = R(SMMU + 0x1000), cba2r = R(SMMU + 0x1800);
-	con_hex2("  GR1", "cbar0=", cbar, "cba2r0=", cba2r);
-	con_str("CB step 2", "read CB0 SCTLR/TCR/FSR");
-	con_hex2("  CB0", "sctlr=", R(c + 0x0), "tcr=", R(c + 0x30));
-	con_str("CB step 3", "write CBA2R0, CBAR0");
 	W(SMMU + 0x1800, 1);				/* CBA2R0: VA64 */
 	W(SMMU + 0x1000, 1u << 16);			/* CBAR0: S1 translate, S2 bypass */
-	con_hex2("  GR1", "cbar0=", R(SMMU + 0x1000), "cba2r0=", R(SMMU + 0x1800));
-	con_str("CB step 4", "write CB0 MAIR/TCR2/TCR/TTBR0");
 	W(c + 0x38, 0x44ff);				/* MAIR0: attr0 = normal WB, attr1 = normal NC */
 	W(c + 0x3c, 0);
 	W(c + 0x10, 2 | (7u << 15));			/* TCR2: PASize 40 bit, SEP = upstream (else VA bit 31 picks TTBR1!) */
@@ -246,11 +238,15 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	for (int i = 0; i < 2000 && (R(SMMU + 0x74) & 1); i++)
 		udelay(1);
 	con_hex2("  sync", "cb=", R(c + 0x7f4), "global=", R(SMMU + 0x74));
-	con_str("CB step 6", "SCTLR enable");
 	W(c + 0x0, (1u << 6) | (1u << 5) | (1u << 2) | (1u << 1) | 1);	/* CFIE CFRE AFE TRE M */
-	con_str("CB step 7", "S2CR0 -> translate CB0");
 	W(SMMU + 0xc00, 0);				/* S2CR0: translate, CB 0 */
 	W(SMMU + 0x800, smr0);
+#ifdef FLAME_GPU_BLIT
+	/* secure-mode traffic (kgsl gfx3d_secure = SID 2): try routing it to CB0 too */
+	W(SMMU + 0xc04, 0);
+	W(SMMU + 0x804, 0x80000000u | (0x400u << 16) | 2);
+	con_hex2("SMMU sid2", "smr1=", R(SMMU + 0x804), "s2cr1=", R(SMMU + 0xc04));
+#endif
 	__asm__ volatile("dsb sy" ::: "memory");
 	con_hex2("SMMU cb0", "cbar=", R(SMMU + 0x1000), "sctlr=", R(c));
 	con_hex2("SMMU cb0", "ttbr0=", R(c + 0x20), "tcr=", R(c + 0x30));
@@ -509,13 +505,15 @@ static void cp_test(void)
 		con_hex2("BLIT px", "tl=", o[100 * (FB_STRIDE / 4) + 100], "mid=", o[700 * (FB_STRIDE / 4) + 360]);
 	}
 	con_hex2("BLIT", "fsr=", R(SMMU + 0x8000 + 0x58), "far=", R(SMMU + 0x8000 + 0x60));
+	con_hex2("SMMU global", "gfsr=", R(SMMU + 0x48), "gfar=", R(SMMU + 0x40));
+	con_hex2("SMMU global", "gfsynr0=", R(SMMU + 0x50), "gfsynr1=", R(SMMU + 0x54));
 	con_str("GPU", scratch[1] == 0xB1170D0E ? "GPU SCALED THE TEST PICTURE ONTO THE SCREEN" : "blit did not finish");
 #endif
 }
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8l: Adreno 613 scales a picture");
+	con_str("SHIM", "ios-flame stage 8m: Adreno 613 scales a picture");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
