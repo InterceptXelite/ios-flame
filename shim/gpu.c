@@ -205,7 +205,13 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	dcache_flush(smmu_l2, sizeof(smmu_l2));
 	for (uint64_t t = 0; t < 4; t++) {
 		for (uint64_t i = 0; i < 512; i++)
-			smmu_l2[t][i] = (((2 + t) << 30) + (i << 21)) | (1u << 10) | (3u << 8) | (1u << 6) | 1;
+		{
+			uint64_t pa = ((2 + t) << 30) + (i << 21);
+			/* the panel memory (scanned by the display, which does not snoop) is
+			 * mapped Normal non-cacheable (attr 1); everything else write-back (attr 0) */
+			uint64_t attr = (pa + (2u << 20) > FB_BASE && pa < FB_BASE + FB_SIZE) ? (1u << 2) : 0;
+			smmu_l2[t][i] = pa | (1u << 10) | (3u << 8) | (1u << 6) | attr | 1;
+		}
 		smmu_l1[2 + t] = (uintptr_t)smmu_l2[t] | 3;	/* table descriptor */
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
@@ -223,7 +229,7 @@ static int smmu_identity_cb0(uintptr_t cb, uint32_t psz, uint32_t smr0)
 	W(SMMU + 0x1000, 1u << 16);			/* CBAR0: S1 translate, S2 bypass */
 	con_hex2("  GR1", "cbar0=", R(SMMU + 0x1000), "cba2r0=", R(SMMU + 0x1800));
 	con_str("CB step 4", "write CB0 MAIR/TCR2/TCR/TTBR0");
-	W(c + 0x38, 0xff);				/* MAIR0 attr0 = normal write-back */
+	W(c + 0x38, 0x44ff);				/* MAIR0: attr0 = normal WB, attr1 = normal NC */
 	W(c + 0x3c, 0);
 	W(c + 0x10, 2 | (7u << 15));			/* TCR2: PASize 40 bit, SEP = upstream (else VA bit 31 picks TTBR1!) */
 	W(c + 0x30, 25 | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23));	/* TCR: T0SZ 25, 4K, walks WB IS, EPD1 */
@@ -488,8 +494,6 @@ static void cp_test(void)
 	con_hex2("RBBM", "status=", R(GREG(0x210)), "int0=", R(GREG(0x201)));
 	con_hex2("MEM", "scratch=", scratch[0], "faults=", bad);
 	con_hex2("SMMU cb0", "fsr=", R(SMMU + 0x8000 + 0x58), "far=", R(SMMU + 0x8000 + 0x60));
-	con_hex2("SMMU cb0", "fsynr0=", R(SMMU + 0x8000 + 0x68), "fsynr1=", R(SMMU + 0x8000 + 0x6c));
-	con_hex2("SMMU", "cbfrsynra0=", R(SMMU + 0x1400), "gfsr=", R(SMMU + 0x48));
 	W(GREG(0xf400), 0);				/* leave secure mode (no zap) */
 	con_hex("SECVID after", R(GREG(0xf400)));
 	con_str("GPU", scratch[0] == 0xC0FFEE01 ? "GPU EXECUTED COMMANDS AND WROTE MEMORY" :
@@ -498,7 +502,12 @@ static void cp_test(void)
 	end = ticks() + 19200ULL * 3000;
 	while (ticks() < end && scratch[1] != 0xB1170D0E)
 		dcache_flush(scratch, 64);
+	dcache_flush((void *)OUT_PA, (uint64_t)FB_STRIDE * OUT_H);	/* belt and braces */
 	con_hex2("BLIT", "done=", scratch[1], "rptr=", R(GREG(0x806)));
+	{
+		volatile uint32_t *o = (volatile uint32_t *)OUT_PA;
+		con_hex2("BLIT px", "tl=", o[100 * (FB_STRIDE / 4) + 100], "mid=", o[700 * (FB_STRIDE / 4) + 360]);
+	}
 	con_hex2("BLIT", "fsr=", R(SMMU + 0x8000 + 0x58), "far=", R(SMMU + 0x8000 + 0x60));
 	con_str("GPU", scratch[1] == 0xB1170D0E ? "GPU SCALED THE TEST PICTURE ONTO THE SCREEN" : "blit did not finish");
 #endif
@@ -506,7 +515,7 @@ static void cp_test(void)
 
 void test_gpu(void)
 {
-	con_str("SHIM", "ios-flame stage 8k: Adreno 613 scales a picture");
+	con_str("SHIM", "ios-flame stage 8l: Adreno 613 scales a picture");
 	con_skip();
 	if (gpu_power() || gpu_alive())
 		return;
