@@ -116,3 +116,15 @@ Expect the kernel console on screen, ending at "no root device" (stage 4 not don
 Rules for ALL flame code (shim and XNU drivers): plain MMIO accessors only (GIC is emulated by Gunyah); never CNTP_*; don't rely on the APSS watchdog; wake UFS via W-LUN 0xD0 before any LU command.
 
 **Stage 1 complete (2026-11-11).** Next: stage 2, kernel CI build.
+
+## Stage 3 (XNU on the phone)
+
+| Image | Result | Learned / fixed |
+|---|---|---|
+| 3 | shim: `no DRAM bank at phys_base` | XNU RAM must come from ABL's /memory |
+| 3b | DRAM banks (6 GB phone): 0x80000000 1678M, 0xBC300000 30M, 0xEF900000 263M, then 3 banks above 4G (1021M, 1981M, 1024M) | upper DRAM split by carve-outs |
+| 3c | **XNU runs**: `kprintf initialized`, then `Unclassified kernel abort (fault_code=0x10)` | `/pram` (panic log) sat in the hole between banks → shim relocates it into the chosen bank |
+| 3d | `Undefined kernel instruction ... instr=d51be228` (msr CNTP_CTL_EL0) in `fiq_context_init` | patch `0092-flame-no-physical-timer` |
+| **3e** | **PASS**: BSD, MAC, AMFI, IOKit platform expert, AKS, WDT, HID, battery, `AppleCLCD 720x1640 ... presented as 1125x2436`, UFS driver, `BSD root: ufsroot0` → userdata read; `unknown Volume Signature: 671a` (encrypted Android f2fs), `cannot mount root, errno = 19` loop | **expected end of stage 3** (no iOS root yet). Read-only mode, nothing written |
+
+**Stage 3 complete (2026-11-12).** Next: stage 4, the iOS root image in userdata (erases Android data, needs confirmation).
